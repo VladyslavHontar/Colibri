@@ -1,0 +1,21 @@
+syntax = "proto3";
+package shredstream;
+
+message Entry {
+    uint64 slot    = 1;
+    bytes  entries = 2;
+}
+
+message Transaction {
+    uint64 slot       = 1;
+    string signature  = 2;
+    bytes  raw_tx     = 3;
+}
+
+message SubscribeEntriesRequest {}
+message SubscribeTransactionsRequest {}
+
+service ShredstreamProxy {
+    rpc SubscribeEntries(SubscribeEntriesRequest) returns (stream Entry);
+    rpc SubscribeTransactions(SubscribeTransactionsRequest) returns (stream Transaction);
+}

@@ -1,0 +1,22 @@
+version: "3.9"
+services:
+  colibri:
+    build:
+      context: ../..  # /Users/newuser/RustroverProjects/ — contains both Colibri/ and Deshreder/
+      dockerfile: Colibri/colibri/Dockerfile
+    platform: linux/amd64
+    ports:
+      - "8000:8000/udp"   # gossip
+      - "8200:8200/udp"   # TVU — validators send shreds here
+      - "8210:8210/udp"   # repair responses (must be open in cloud firewall)
+      - "8888:8888"       # gRPC SubscribeEntries
+    environment:
+      - RUST_LOG=info
+    restart: unless-stopped
+    command: >
+      ./colibri
+        --ip ${GOSSIP_IP}
+        --entrypoint entrypoint.mainnet-beta.solana.com:8001
+        --entrypoint entrypoint2.mainnet-beta.solana.com:8001
+        --entrypoint entrypoint3.mainnet-beta.solana.com:8001
+        --grpc-port 8888

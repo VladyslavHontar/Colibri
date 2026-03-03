@@ -1,0 +1,43 @@
+[package]
+name    = "colibri"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "colibri"
+path = "src/main.rs"
+
+[dependencies]
+# Deshredder — now a standalone library at the sibling repo.
+deshredder = { git = "https://github.com/VladyslavHontar/Deshreder.git" }
+
+# Gossip stack — agave v3.1.5, same tag as deshredder's solana-ledger.
+# Both share one rocksdb build (0.23) — no native library conflict.
+# GossipService::new takes Arc<[UdpSocket]> in agave (vs UdpSocket in jito fork).
+solana-gossip     = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
+solana-net-utils  = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
+solana-streamer   = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
+# Pin leaf crates to the exact agave v3.1.5 workspace versions.
+solana-keypair    = "=3.0.1"
+solana-signer     = "=3.0.0"
+solana-hash       = "=3.1.0"
+solana-pubkey     = "=3.0.0"
+solana-time-utils = "=3.0.0"
+solana-signature  = { version = "=3.1.0", default-features = false }
+
+# gRPC
+tonic = { version = "0.12", features = ["tls"] }
+prost = "0.13"
+
+# Async + utils
+tokio      = { workspace = true }
+anyhow     = { workspace = true }
+bincode    = { workspace = true }
+serde_json = "1"
+subtle     = "2"
+socket2    = "0.5"
+env_logger = "0.11"
+log        = "0.4"
+
+[build-dependencies]
+tonic-build = "0.12"

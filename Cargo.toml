@@ -1,0 +1,17 @@
+# Workspace contains only the colibri binary.
+# The deshredder library lives at /Users/newuser/RustroverProjects/Deshreder/
+# as a standalone open-source crate.
+[workspace]
+members  = ["colibri"]
+resolver = "2"
+
+[workspace.dependencies]
+# Deshredder now uses agave v3.1.5 (agave-unstable-api feature exposes the shred module).
+# Colibri gossip also uses agave v3.1.5 → single rocksdb 0.23, no native lib conflict.
+bincode = "1"
+tokio   = { version = "1", features = ["full"] }
+anyhow  = "1"
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
