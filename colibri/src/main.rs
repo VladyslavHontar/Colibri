@@ -24,6 +24,7 @@
 
 #![allow(deprecated)]
 
+mod coverage;
 mod server;
 mod repair_wire;
 
