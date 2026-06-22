@@ -665,6 +665,11 @@ fn main() -> Result<()> {
     let arc_pongs_sent: Arc<AtomicU64>  = Arc::new(AtomicU64::new(0));
     let arc_responses:  Arc<AtomicU64>  = Arc::new(AtomicU64::new(0));
 
+    // Set of slots that reached genuine is_full() completion (not deadline eviction).
+    // Written by the repair thread in the RepairAction::Complete arm (targeted only).
+    // Read by the probe coordinator to distinguish success from timeout.
+    let completed_set: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+
     eprintln!("[colibri] probe-depth:      {}", cfg.probe_depth);
     eprintln!("[colibri] probe-window-max: {}", cfg.probe_window_max);
 
@@ -811,18 +816,19 @@ fn main() -> Result<()> {
     });
 
     {
-        let cluster_repair   = cluster_info.clone();
-        let keypair_repair   = keypair.clone();
-        let exit_repair      = exit.clone();
-        let repair_map_rep   = repair_map.clone();
-        let target_slots_rep = target_slots.clone();
-        let tier1_repair     = tier1_pubkeys.clone();
-        let repair_port      = cfg.repair_port;
-        let repair_ip        = cfg.ip;
-        let meter_rep        = meter.clone();
-        let arc_pings_rep    = arc_pings_seen.clone();
-        let arc_pongs_rep    = arc_pongs_sent.clone();
-        let arc_resp_rep     = arc_responses.clone();
+        let cluster_repair    = cluster_info.clone();
+        let keypair_repair    = keypair.clone();
+        let exit_repair       = exit.clone();
+        let repair_map_rep    = repair_map.clone();
+        let target_slots_rep  = target_slots.clone();
+        let tier1_repair      = tier1_pubkeys.clone();
+        let repair_port       = cfg.repair_port;
+        let repair_ip         = cfg.ip;
+        let meter_rep         = meter.clone();
+        let arc_pings_rep     = arc_pings_seen.clone();
+        let arc_pongs_rep     = arc_pongs_sent.clone();
+        let arc_resp_rep      = arc_responses.clone();
+        let completed_set_rep = completed_set.clone();
         std::thread::spawn(move || {
             let repair_shred_tx = repair_shred_tx;
             let repair_sock = UdpSocket::bind(
@@ -959,6 +965,13 @@ fn main() -> Result<()> {
                                     );
                                     meter_rep.lock().unwrap_or_else(|e| e.into_inner())
                                         .mark_complete(slot, Instant::now());
+                                    // Record genuine is_full() completion so the probe
+                                    // coordinator can distinguish it from a 30s deadline
+                                    // eviction (which also removes the slot from repair_map
+                                    // but must NOT count as a successful repair).
+                                    completed_set_rep.lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .insert(slot);
                                 }
                                 done_slots.push(slot);
                                 continue;
@@ -1081,14 +1094,14 @@ fn main() -> Result<()> {
         Arc::new(Mutex::new(Vec::new()));
 
     {
-        let tip_c          = observed_tip.clone();
-        let target_slots_c = target_slots.clone();
-        let meter_c        = meter.clone();
-        let repair_map_c   = repair_map.clone();
-        let exit_c         = exit.clone();
-        let probe_depths_c = probe_depths_arc.clone();
-        let probe_depth    = cfg.probe_depth;
-        let probe_win_max  = cfg.probe_window_max;
+        let tip_c             = observed_tip.clone();
+        let target_slots_c    = target_slots.clone();
+        let meter_c           = meter.clone();
+        let exit_c            = exit.clone();
+        let probe_depths_c    = probe_depths_arc.clone();
+        let probe_depth       = cfg.probe_depth;
+        let probe_win_max     = cfg.probe_window_max;
+        let completed_set_c   = completed_set.clone();
 
         std::thread::spawn(move || {
             // Wait until the TVU has seen at least one shred.
@@ -1155,27 +1168,25 @@ fn main() -> Result<()> {
                 for (depth, slot, enqueued_at, result) in pd.iter_mut() {
                     if result.is_some() { continue; }
                     let elapsed = enqueued_at.elapsed();
-                    // Check if it's complete in repair_map (will be evicted if complete).
-                    // Since the repair thread evicts completed slots, we check the meter
-                    // to see if it was completed (for probe slots outside coverage range,
-                    // we monitor the repair_map directly).
-                    let is_gone = repair_map_c.lock()
+                    // Check the completed_set first: only genuine is_full() completions
+                    // are inserted there (not 30s deadline evictions).  A slot that times
+                    // out is removed from repair_map at its 30s deadline but will NOT
+                    // appear in completed_set, so map-absence must never be treated as
+                    // success.
+                    let genuinely_complete = completed_set_c.lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .get(slot)
-                        .is_none();
-                    // Gone from repair_map after some activity = likely Complete or deadline.
-                    // We can't distinguish without separate tracking, but 30s deadline is
-                    // the same as targeted deadline, so if it's gone after >5s it completed
-                    // OR it was never inserted (queue lag). Use 35s timeout to be safe.
-                    if elapsed >= Duration::from_secs(35) {
-                        *result = Some(false);
-                        eprintln!("[probe] depth={depth} slot={slot} TIMED_OUT");
-                    } else if is_gone && elapsed >= Duration::from_secs(2) {
-                        // Slot gone from repair_map — either completed or hit 30s deadline.
-                        // Mark as completed (optimistic; actual truth captured by [repair] log).
+                        .contains(slot);
+                    if genuinely_complete {
                         *result = Some(true);
                         eprintln!("[probe] depth={depth} slot={slot} COMPLETE (elapsed={}ms)", elapsed.as_millis());
+                    } else if elapsed >= Duration::from_secs(35) {
+                        // Wall-clock deadline independent of repair_map presence:
+                        // the slot's 30s repair deadline has passed and it was never
+                        // completed, so repair could not serve this depth.
+                        *result = Some(false);
+                        eprintln!("[probe] depth={depth} slot={slot} TIMED_OUT");
                     }
+                    // Otherwise: still pending (None) — neither completed nor deadline-expired.
                 }
             }
 
