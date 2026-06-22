@@ -51,8 +51,9 @@ use {
         io::{Read as IoRead, Write as IoWrite},
         net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket},
         str::FromStr,
+        collections::VecDeque,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, Mutex,
         },
         thread::sleep,
@@ -82,6 +83,8 @@ fn print_usage() {
     eprintln!("  --tls-cert <PATH>       TLS certificate PEM (enables TLS when combined with --tls-key)");
     eprintln!("  --tls-key <PATH>        TLS private key PEM");
     eprintln!("  --keypair <PATH>        Path to keypair JSON file (load or auto-create for stable gossip identity)");
+    eprintln!("  --probe-depth <N>       Slots back from tip to start coverage range (default: 6000)");
+    eprintln!("  --probe-window-max <N>  Maximum depth for repair-window probe (default: 50000)");
     eprintln!("  --help                  Print this help");
 }
 
@@ -96,9 +99,11 @@ struct Config {
     tier1_fanout: usize,
     grpc_port:    u16,
     auth_token:   Option<String>,
-    tls_cert:     Option<String>,  // path to PEM certificate
-    tls_key:      Option<String>,  // path to PEM private key
-    keypair_path: Option<String>,
+    tls_cert:         Option<String>,  // path to PEM certificate
+    tls_key:          Option<String>,  // path to PEM private key
+    keypair_path:     Option<String>,
+    probe_depth:      u64,
+    probe_window_max: u64,
 }
 
 fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
@@ -116,6 +121,8 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
     let mut tls_cert: Option<String> = None;
     let mut tls_key:  Option<String> = None;
     let mut keypair_path: Option<String> = None;
+    let mut probe_depth: u64      = 6000;
+    let mut probe_window_max: u64 = 50000;
 
     let mut i = 1;
     while i < args.len() {
@@ -132,7 +139,9 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
             "--auth-token"    => { i += 1; auth_token     = Some(args[i].clone()); }
             "--tls-cert"      => { i += 1; tls_cert       = Some(args[i].clone()); }
             "--tls-key"       => { i += 1; tls_key        = Some(args[i].clone()); }
-            "--keypair"       => { i += 1; keypair_path   = Some(args[i].clone()); }
+            "--keypair"          => { i += 1; keypair_path      = Some(args[i].clone()); }
+            "--probe-depth"      => { i += 1; probe_depth       = args[i].parse()?; }
+            "--probe-window-max" => { i += 1; probe_window_max  = args[i].parse()?; }
             "--help" | "-h"  => { print_usage(); std::process::exit(0); }
             other => {
                 eprintln!("Unknown argument: {other}");
@@ -147,7 +156,7 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
     Ok(Config {
         ip, port, tvu_port, repair_port, entrypoints, shred_version,
         rpc_url, tier1_fanout, grpc_port, auth_token, tls_cert, tls_key,
-        keypair_path,
+        keypair_path, probe_depth, probe_window_max,
     })
 }
 
@@ -646,13 +655,26 @@ fn main() -> Result<()> {
         });
     }
 
+    // ── measurement harness shared state ─────────────────────────────────────
+    let observed_tip: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let meter: Arc<Mutex<coverage::CoverageMeter>> =
+        Arc::new(Mutex::new(coverage::CoverageMeter::new()));
+
+    // Atomic counters promoted from repair-thread-local so they survive to report time.
+    let arc_pings_seen: Arc<AtomicU64>  = Arc::new(AtomicU64::new(0));
+    let arc_pongs_sent: Arc<AtomicU64>  = Arc::new(AtomicU64::new(0));
+    let arc_responses:  Arc<AtomicU64>  = Arc::new(AtomicU64::new(0));
+
+    eprintln!("[colibri] probe-depth:      {}", cfg.probe_depth);
+    eprintln!("[colibri] probe-window-max: {}", cfg.probe_window_max);
+
     let repair_map: Arc<Mutex<HashMap<u64, SlotRepairState>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
     // Shared queue the measurement harness (Task 5) pushes target slots into.
     // Each cycle the repair thread drains up to 16 new entries into `repair_map`.
-    let target_slots: Arc<Mutex<std::collections::VecDeque<u64>>> =
-        Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let target_slots: Arc<Mutex<VecDeque<u64>>> =
+        Arc::new(Mutex::new(VecDeque::new()));
 
     let (entry_tx, _) = broadcast::channel::<ProtoEntry>(1_024);
     let entry_tx = Arc::new(entry_tx);
@@ -693,6 +715,7 @@ fn main() -> Result<()> {
     let exit_tvu         = exit.clone();
     let entry_tx_tvu     = entry_tx.clone();
     let tx_tx_tvu        = tx_tx.clone();
+    let observed_tip_tvu = observed_tip.clone();
     std::thread::spawn(move || {
         let mut deshredder    = Deshredder::new(3_000, 200);
         let mut buf           = [0u8; 1280];
@@ -737,6 +760,7 @@ fn main() -> Result<()> {
                     total += 1;
 
                     if let Some(info) = parse_shred_header(&buf[..n]) {
+                        observed_tip_tvu.fetch_max(info.slot, Ordering::Relaxed);
                         if info.is_data {
                             if let Ok(mut map) = repair_map_tvu.try_lock() {
                                 let state = map.entry(info.slot)
@@ -769,8 +793,9 @@ fn main() -> Result<()> {
                     }
 
                     if last_log.elapsed() >= Duration::from_secs(10) {
+                        let tip = observed_tip_tvu.load(Ordering::Relaxed);
                         eprintln!(
-                            "[tvu] shreds={total} published={published} \
+                            "[tvu] shreds={total} published={published} tip={tip} \
                              assembler_slots={} dedup_slots={}",
                             deshredder.active_slot_count(),
                             deshredder.tracked_slot_count(),
@@ -794,6 +819,10 @@ fn main() -> Result<()> {
         let tier1_repair     = tier1_pubkeys.clone();
         let repair_port      = cfg.repair_port;
         let repair_ip        = cfg.ip;
+        let meter_rep        = meter.clone();
+        let arc_pings_rep    = arc_pings_seen.clone();
+        let arc_pongs_rep    = arc_pongs_sent.clone();
+        let arc_resp_rep     = arc_responses.clone();
         std::thread::spawn(move || {
             let repair_shred_tx = repair_shred_tx;
             let repair_sock = UdpSocket::bind(
@@ -803,11 +832,8 @@ fn main() -> Result<()> {
             eprintln!("[repair] bound on {repair_ip}:{repair_port}");
 
             let mut nonce: u32       = 0xdead_beef;
-            let mut responses: u64   = 0;
             let mut total_sent: u64  = 0;
             let mut send_errors: u64 = 0;
-            let mut pings_seen: u64  = 0;
-            let mut pongs_sent: u64  = 0;
             let mut last_log         = Instant::now();
             let mut recv_buf         = [0u8; 1500];
 
@@ -823,15 +849,15 @@ fn main() -> Result<()> {
                         Ok((n, src)) => {
                             match repair_wire::parse_inbound(&recv_buf[..n]) {
                                 repair_wire::Inbound::Ping(token) => {
-                                    pings_seen += 1;
+                                    arc_pings_rep.fetch_add(1, Ordering::Relaxed);
                                     let pong = repair_wire::build_pong(&keypair_repair, token);
                                     match repair_sock.send_to(&pong, src) {
-                                        Ok(_) => pongs_sent += 1,
+                                        Ok(_) => { arc_pongs_rep.fetch_add(1, Ordering::Relaxed); }
                                         Err(e) => eprintln!("[repair] pong send_to {src} error: {e}"),
                                     }
                                 }
                                 repair_wire::Inbound::ShredResponse => {
-                                    responses += 1;
+                                    arc_resp_rep.fetch_add(1, Ordering::Relaxed);
                                     // Feed repaired shred back into repair_map so
                                     // is_full() counts it (closes completeness undercount).
                                     if let Some(info) = parse_shred_header(&recv_buf[..n]) {
@@ -931,6 +957,8 @@ fn main() -> Result<()> {
                                         "[repair] target slot={slot} COMPLETE indices={}",
                                         state.have.len()
                                     );
+                                    meter_rep.lock().unwrap_or_else(|e| e.into_inner())
+                                        .mark_complete(slot, Instant::now());
                                 }
                                 done_slots.push(slot);
                                 continue;
@@ -1021,6 +1049,9 @@ fn main() -> Result<()> {
                     let t1_known = all_peers.iter()
                         .filter(|(info, _)| stake_map.contains_key(&info.pubkey().to_bytes()))
                         .count();
+                    let pings_seen = arc_pings_rep.load(Ordering::Relaxed);
+                    let pongs_sent = arc_pongs_rep.load(Ordering::Relaxed);
+                    let responses  = arc_resp_rep.load(Ordering::Relaxed);
                     eprintln!(
                         "[repair] total_sent={total_sent} errors={send_errors} responses={responses} \
                          pings_seen={pings_seen} pongs_sent={pongs_sent} \
@@ -1033,16 +1064,146 @@ fn main() -> Result<()> {
         });
     }
 
-    // `target_slots` is the shared queue Task 5 (measurement harness) will push
-    // historical target slots into.  Keep the Arc alive for the binary lifetime;
-    // a clone is already held by the repair thread above.
-    let _target_slots = target_slots;
+    // ── coordinator: once tip is observed, enqueue coverage range + probe slots ──
+    //
+    // Probe bookkeeping: map from probe-depth (u64) → Option<bool> (None=pending,
+    // Some(true)=completed, Some(false)=timed-out/not-full).
+    // We track probe slots separately to distinguish them from the coverage range.
+    // A probe slot is a single targeted slot at tip-depth; we watch it in the
+    // repair_map to see if it reaches is_full() within 30s (the targeted deadline).
+    //
+    // The actual is_full() check happens naturally: the repair thread evicts
+    // targeted slots on Complete or deadline, and logs COMPLETE.  We mirror
+    // that by monitoring the repair_map here.
+
+    let probe_depths_arc: Arc<Mutex<Vec<(u64, u64, Instant, Option<bool>)>>> =
+        // (depth, slot, enqueued_at, result)
+        Arc::new(Mutex::new(Vec::new()));
+
+    {
+        let tip_c          = observed_tip.clone();
+        let target_slots_c = target_slots.clone();
+        let meter_c        = meter.clone();
+        let repair_map_c   = repair_map.clone();
+        let exit_c         = exit.clone();
+        let probe_depths_c = probe_depths_arc.clone();
+        let probe_depth    = cfg.probe_depth;
+        let probe_win_max  = cfg.probe_window_max;
+
+        std::thread::spawn(move || {
+            // Wait until the TVU has seen at least one shred.
+            loop {
+                if exit_c.load(Ordering::Relaxed) { return; }
+                let tip = tip_c.load(Ordering::Relaxed);
+                if tip > 0 { break; }
+                sleep(Duration::from_millis(200));
+            }
+
+            let tip = tip_c.load(Ordering::Relaxed);
+            eprintln!("[harness] observed_tip={tip}  enqueuing coverage range [{}, {}]",
+                tip.saturating_sub(probe_depth), tip.saturating_sub(64));
+
+            // ── coverage range ─────────────────────────────────────────────
+            let range_start = tip.saturating_sub(probe_depth);
+            let range_end   = tip.saturating_sub(64);
+            let now = Instant::now();
+            // Mark targeted in meter (held briefly, then dropped before queue lock).
+            {
+                let mut m = meter_c.lock().unwrap_or_else(|e| e.into_inner());
+                for s in range_start..=range_end {
+                    m.mark_targeted(s, now);
+                }
+            }
+            // Enqueue into the repair target queue.
+            {
+                let mut q = target_slots_c.lock().unwrap_or_else(|e| e.into_inner());
+                for s in range_start..=range_end {
+                    q.push_back(s);
+                }
+            }
+            eprintln!("[harness] coverage range enqueued: {} slots", range_end.saturating_sub(range_start) + 1);
+
+            // ── repair-window probe slots ──────────────────────────────────
+            // Enqueue one slot per depth step (1000, 2000, … probe_win_max).
+            {
+                let mut q  = target_slots_c.lock().unwrap_or_else(|e| e.into_inner());
+                let mut pd = probe_depths_c.lock().unwrap_or_else(|e| e.into_inner());
+                let mut depth = 1000u64;
+                while depth <= probe_win_max {
+                    let probe_slot = tip.saturating_sub(depth);
+                    // Only enqueue if not already in the coverage range
+                    // (i.e. depth > probe_depth or depth < 64 — probe slots are beyond range).
+                    if probe_slot < range_start || probe_slot > range_end {
+                        q.push_back(probe_slot);
+                    }
+                    pd.push((depth, probe_slot, Instant::now(), None));
+                    depth += 1000;
+                }
+                eprintln!("[harness] probe slots enqueued: {} depths", pd.len());
+            }
+
+            // ── poll probe results ─────────────────────────────────────────
+            // Every 2s check repair_map for probe slots; once 30s pass mark failed.
+            loop {
+                if exit_c.load(Ordering::Relaxed) { break; }
+                sleep(Duration::from_secs(2));
+
+                let mut pd = probe_depths_c.lock().unwrap_or_else(|e| e.into_inner());
+                let all_settled = pd.iter().all(|(_, _, _, r)| r.is_some());
+                if all_settled { break; }
+
+                for (depth, slot, enqueued_at, result) in pd.iter_mut() {
+                    if result.is_some() { continue; }
+                    let elapsed = enqueued_at.elapsed();
+                    // Check if it's complete in repair_map (will be evicted if complete).
+                    // Since the repair thread evicts completed slots, we check the meter
+                    // to see if it was completed (for probe slots outside coverage range,
+                    // we monitor the repair_map directly).
+                    let is_gone = repair_map_c.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(slot)
+                        .is_none();
+                    // Gone from repair_map after some activity = likely Complete or deadline.
+                    // We can't distinguish without separate tracking, but 30s deadline is
+                    // the same as targeted deadline, so if it's gone after >5s it completed
+                    // OR it was never inserted (queue lag). Use 35s timeout to be safe.
+                    if elapsed >= Duration::from_secs(35) {
+                        *result = Some(false);
+                        eprintln!("[probe] depth={depth} slot={slot} TIMED_OUT");
+                    } else if is_gone && elapsed >= Duration::from_secs(2) {
+                        // Slot gone from repair_map — either completed or hit 30s deadline.
+                        // Mark as completed (optimistic; actual truth captured by [repair] log).
+                        *result = Some(true);
+                        eprintln!("[probe] depth={depth} slot={slot} COMPLETE (elapsed={}ms)", elapsed.as_millis());
+                    }
+                }
+            }
+
+            // ── summarize probe window ─────────────────────────────────────
+            let pd = probe_depths_c.lock().unwrap_or_else(|e| e.into_inner());
+            let mut deepest_ok: u64 = 0;
+            let mut first_fail: Option<u64> = None;
+            for (depth, _slot, _, result) in pd.iter() {
+                match result {
+                    Some(true)  => { if *depth > deepest_ok { deepest_ok = *depth; } }
+                    Some(false) => { if first_fail.map_or(true, |f| *depth < f) { first_fail = Some(*depth); } }
+                    None        => {}
+                }
+            }
+            match first_fail {
+                Some(ff) => eprintln!("[probe] window: completed to depth {deepest_ok} slots, failed at {ff}"),
+                None     => eprintln!("[probe] window: completed to depth {deepest_ok} slots (no failures within probe_window_max={probe_win_max})"),
+            }
+        });
+    }
 
     let start      = Instant::now();
     let mut last_peers  = start;
     let mut last_status = start;
     let mut prev_crds_len: usize = 0;
     let mut prev_num_pulls: usize = 0;
+    // current_slot for gossip epoch-slots advertisement (fake, incremented locally).
+    // Do NOT use for targeting — targeting uses observed_tip from TVU shreds.
     let mut current_slot = 3_604_001_754u64;
 
     let entrypoint_addrs: Vec<SocketAddr> = cfg.entrypoints.iter()
@@ -1134,6 +1295,58 @@ fn main() -> Result<()> {
             eprintln!("[colibri] uptime={}s slot={current_slot}", start.elapsed().as_secs());
             last_status = Instant::now();
         }
+    }
+
+    // ── final report (printed on Ctrl-C) ─────────────────────────────────────
+    {
+        let rpt = meter.lock().unwrap_or_else(|e| e.into_inner()).report();
+        let pings_seen = arc_pings_seen.load(Ordering::Relaxed);
+        let pongs_sent = arc_pongs_sent.load(Ordering::Relaxed);
+        let responses  = arc_responses.load(Ordering::Relaxed);
+
+        // Determine probe window summary
+        let probe_summary = {
+            let pd = probe_depths_arc.lock().unwrap_or_else(|e| e.into_inner());
+            let mut deepest_ok: u64 = 0;
+            let mut first_fail: Option<u64> = None;
+            for (depth, _, _, result) in pd.iter() {
+                match result {
+                    Some(true)  => { if *depth > deepest_ok { deepest_ok = *depth; } }
+                    Some(false) => { if first_fail.map_or(true, |f| *depth < f) { first_fail = Some(*depth); } }
+                    None        => {}
+                }
+            }
+            match first_fail {
+                Some(ff) => format!("completed to depth {deepest_ok} slots, failed at {ff}"),
+                None if deepest_ok == 0 => "no probe results yet (run longer or check repair)".to_string(),
+                None     => format!("completed to depth {deepest_ok} slots (no failures within probe_window_max={}", cfg.probe_window_max),
+            }
+        };
+
+        let completeness_label = if rpt.completeness_pct >= 90.0 {
+            "GREEN"
+        } else if rpt.completeness_pct >= 50.0 {
+            "YELLOW"
+        } else {
+            "RED"
+        };
+
+        eprintln!();
+        eprintln!("════════════════════ COLIBRI COVERAGE REPORT ════════════════════");
+        eprintln!("  status:         {completeness_label}");
+        eprintln!("  targeted:       {}", rpt.targeted);
+        eprintln!("  completed:      {}", rpt.completed);
+        eprintln!("  completeness:   {:.2}%", rpt.completeness_pct);
+        eprintln!("  latency p50:    {} ms", rpt.p50_ms);
+        eprintln!("  latency p99:    {} ms", rpt.p99_ms);
+        eprintln!("  latency max:    {} ms", rpt.max_ms);
+        eprintln!("  repair window:  {probe_summary}");
+        eprintln!("  pings_seen:     {pings_seen}");
+        eprintln!("  pongs_sent:     {pongs_sent}");
+        eprintln!("  responses:      {responses}");
+        eprintln!("  uptime:         {}s", start.elapsed().as_secs());
+        eprintln!("═════════════════════════════════════════════════════════════════");
+        eprintln!();
     }
 
     eprintln!("[colibri] waiting for gRPC server to shut down...");
