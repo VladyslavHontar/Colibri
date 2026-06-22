@@ -49,7 +49,12 @@ pub enum Inbound {
 ///    variant (same logic as `parse_shred_header` in `main.rs`)  → `ShredResponse`
 /// 3. everything else  → `Other`
 pub fn parse_inbound(buf: &[u8]) -> Inbound {
-    // Rule 1: Ping
+    // Rule 1: Ping — classify by size (132) first, then 4-byte LE discriminant == 0.
+    // This mirrors agave's own RepairResponse recognizer, which gates on
+    // `size == REPAIR_RESPONSE_SERIALIZED_PING_BYTES` before deserializing.
+    // A real shred response landing at exactly 132 bytes with a zero discriminant is
+    // vanishingly unlikely (full shreds are ~1228 bytes), so the collision risk is
+    // negligible and the approach matches agave's reliability.
     if buf.len() == 132 && buf[0..4] == [0, 0, 0, 0] {
         let mut token = [0u8; 32];
         token.copy_from_slice(&buf[36..68]);
@@ -93,6 +98,11 @@ pub fn build_pong(keypair: &Keypair, token: [u8; 32]) -> Vec<u8> {
     pong.extend_from_slice(keypair.pubkey().as_ref());     // from (32 bytes)
     pong.extend_from_slice(&hash_bytes);                   // hash (32 bytes)
     pong.extend_from_slice(sig.as_ref());                  // signature (64 bytes)
+    debug_assert_eq!(
+        &pong[PONG_FROM_OFFSET..PONG_FROM_OFFSET + 32],
+        keypair.pubkey().as_ref(),
+        "from-pubkey not at expected offset"
+    );
     pong
 }
 
