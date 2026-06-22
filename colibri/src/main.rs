@@ -25,6 +25,7 @@
 #![allow(deprecated)]
 
 mod coverage;
+mod oracle;
 mod server;
 mod repair_wire;
 
@@ -85,6 +86,7 @@ fn print_usage() {
     eprintln!("  --keypair <PATH>        Path to keypair JSON file (load or auto-create for stable gossip identity)");
     eprintln!("  --probe-depth <N>       Slots back from tip to start coverage range (default: 6000)");
     eprintln!("  --probe-window-max <N>  Maximum depth for repair-window probe (default: 50000)");
+    eprintln!("  --oracle-rpc <URL>      Enable RPC oracle cross-check (samples 1-in-50 completed slots via getBlock)");
     eprintln!("  --help                  Print this help");
 }
 
@@ -104,6 +106,7 @@ struct Config {
     keypair_path:     Option<String>,
     probe_depth:      u64,
     probe_window_max: u64,
+    oracle_rpc:       Option<String>,
 }
 
 fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
@@ -123,6 +126,7 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
     let mut keypair_path: Option<String> = None;
     let mut probe_depth: u64      = 6000;
     let mut probe_window_max: u64 = 50000;
+    let mut oracle_rpc: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -142,6 +146,7 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
             "--keypair"          => { i += 1; keypair_path      = Some(args[i].clone()); }
             "--probe-depth"      => { i += 1; probe_depth       = args[i].parse()?; }
             "--probe-window-max" => { i += 1; probe_window_max  = args[i].parse()?; }
+            "--oracle-rpc"       => { i += 1; oracle_rpc        = Some(args[i].clone()); }
             "--help" | "-h"  => { print_usage(); std::process::exit(0); }
             other => {
                 eprintln!("Unknown argument: {other}");
@@ -156,11 +161,11 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
     Ok(Config {
         ip, port, tvu_port, repair_port, entrypoints, shred_version,
         rpc_url, tier1_fanout, grpc_port, auth_token, tls_cert, tls_key,
-        keypair_path, probe_depth, probe_window_max,
+        keypair_path, probe_depth, probe_window_max, oracle_rpc,
     })
 }
 
-fn rpc_post(url: &str, body: &str) -> Option<String> {
+pub(crate) fn rpc_post(url: &str, body: &str) -> Option<String> {
     let without_scheme = url.strip_prefix("http://").unwrap_or(url);
     let (host_port, path) = match without_scheme.find('/') {
         Some(i) => (&without_scheme[..i], &without_scheme[i..]),
@@ -670,6 +675,23 @@ fn main() -> Result<()> {
     // Read by the probe coordinator to distinguish success from timeout.
     let completed_set: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
 
+    // Oracle sampler (inert unless --oracle-rpc is passed).
+    // Wraps an OracleSampler; Arc<Mutex<Option<…>>> so the repair thread and
+    // TVU thread can share it without knowing whether oracle is enabled.
+    let oracle_sampler: Arc<Mutex<Option<oracle::OracleSampler>>> =
+        Arc::new(Mutex::new(cfg.oracle_rpc.as_ref().map(|url| {
+            eprintln!("[oracle] enabled — RPC oracle cross-check on {url}");
+            oracle::OracleSampler::new(url.clone())
+        })));
+
+    // Per-slot signature accumulator for oracle sampling.
+    // The TVU/repair deshredder emits ProtoTransaction per tx; we record
+    // signatures here for any slot that is currently in `repair_map` as targeted.
+    // Keyed by slot; populated by the TVU thread; consumed (and removed) in the
+    // repair thread's Complete arm.
+    let oracle_sig_map: Arc<Mutex<HashMap<u64, HashSet<String>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     eprintln!("[colibri] probe-depth:      {}", cfg.probe_depth);
     eprintln!("[colibri] probe-window-max: {}", cfg.probe_window_max);
 
@@ -716,11 +738,13 @@ fn main() -> Result<()> {
         eprintln!("[colibri] TLS:            disabled (plain gRPC)");
     }
 
-    let repair_map_tvu   = repair_map.clone();
-    let exit_tvu         = exit.clone();
-    let entry_tx_tvu     = entry_tx.clone();
-    let tx_tx_tvu        = tx_tx.clone();
-    let observed_tip_tvu = observed_tip.clone();
+    let repair_map_tvu     = repair_map.clone();
+    let exit_tvu           = exit.clone();
+    let entry_tx_tvu       = entry_tx.clone();
+    let tx_tx_tvu          = tx_tx.clone();
+    let observed_tip_tvu   = observed_tip.clone();
+    let oracle_sig_map_tvu = oracle_sig_map.clone();
+    let oracle_enabled_tvu = oracle_sampler.lock().unwrap().is_some();
     std::thread::spawn(move || {
         let mut deshredder    = Deshredder::new(3_000, 200);
         let mut buf           = [0u8; 1280];
@@ -749,6 +773,11 @@ fn main() -> Result<()> {
                         for tx in &entry.transactions {
                             let sig = tx.signatures.first()
                                 .map(|s| s.to_string()).unwrap_or_default();
+                            if oracle_enabled_tvu && !sig.is_empty() {
+                                if let Ok(mut sm) = oracle_sig_map_tvu.try_lock() {
+                                    sm.entry(se.slot).or_insert_with(HashSet::new).insert(sig.clone());
+                                }
+                            }
                             if let Ok(raw) = bincode::serialize(tx) {
                                 let _ = tx_tx_tvu.send(ProtoTransaction {
                                     slot: se.slot, signature: sig, raw_tx: raw,
@@ -787,6 +816,11 @@ fn main() -> Result<()> {
                             for tx in &entry.transactions {
                                 let sig = tx.signatures.first()
                                     .map(|s| s.to_string()).unwrap_or_default();
+                                if oracle_enabled_tvu && !sig.is_empty() {
+                                    if let Ok(mut sm) = oracle_sig_map_tvu.try_lock() {
+                                        sm.entry(se.slot).or_insert_with(HashSet::new).insert(sig.clone());
+                                    }
+                                }
                                 if let Ok(raw) = bincode::serialize(tx) {
                                     let _ = tx_tx_tvu.send(ProtoTransaction {
                                         slot: se.slot, signature: sig, raw_tx: raw,
@@ -828,7 +862,9 @@ fn main() -> Result<()> {
         let arc_pings_rep     = arc_pings_seen.clone();
         let arc_pongs_rep     = arc_pongs_sent.clone();
         let arc_resp_rep      = arc_responses.clone();
-        let completed_set_rep = completed_set.clone();
+        let completed_set_rep  = completed_set.clone();
+        let oracle_sampler_rep = oracle_sampler.clone();
+        let oracle_sig_map_rep = oracle_sig_map.clone();
         std::thread::spawn(move || {
             let repair_shred_tx = repair_shred_tx;
             let repair_sock = UdpSocket::bind(
@@ -972,6 +1008,18 @@ fn main() -> Result<()> {
                                     completed_set_rep.lock()
                                         .unwrap_or_else(|e| e.into_inner())
                                         .insert(slot);
+                                    // Oracle cross-check: if enabled, consume accumulated
+                                    // signatures for this slot and invoke the sampler.
+                                    if let Ok(mut sampler_guard) = oracle_sampler_rep.try_lock() {
+                                        if let Some(sampler) = sampler_guard.as_mut() {
+                                            let sigs = oracle_sig_map_rep
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .remove(&slot)
+                                                .unwrap_or_default();
+                                            sampler.on_complete(slot, &sigs);
+                                        }
+                                    }
                                 }
                                 done_slots.push(slot);
                                 continue;
@@ -1356,6 +1404,11 @@ fn main() -> Result<()> {
         eprintln!("  pongs_sent:     {pongs_sent}");
         eprintln!("  responses:      {responses}");
         eprintln!("  uptime:         {}s", start.elapsed().as_secs());
+        if let Ok(sampler_guard) = oracle_sampler.lock() {
+            if let Some(sampler) = sampler_guard.as_ref() {
+                eprintln!("  {}", sampler.report_line());
+            }
+        }
         eprintln!("═════════════════════════════════════════════════════════════════");
         eprintln!();
     }
