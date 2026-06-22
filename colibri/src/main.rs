@@ -279,32 +279,6 @@ impl SlotRepairState {
     }
 }
 
-fn repair_window_index(
-    keypair:      &Arc<Keypair>,
-    recipient:    &[u8; 32],
-    slot:         u64,
-    shred_index:  u64,
-    nonce:        u32,
-) -> [u8; 160] {
-    let ts = timestamp();
-    let mut buf = [0u8; 160];
-    buf[0..4].copy_from_slice(&3u32.to_le_bytes());
-    buf[68..100].copy_from_slice(keypair.pubkey().as_ref());
-    buf[100..132].copy_from_slice(recipient);
-    buf[132..140].copy_from_slice(&ts.to_le_bytes());
-    buf[140..144].copy_from_slice(&nonce.to_le_bytes());
-    buf[144..152].copy_from_slice(&slot.to_le_bytes());
-    buf[152..160].copy_from_slice(&shred_index.to_le_bytes());
-
-    let mut sign_data = [0u8; 76];
-    sign_data[0..32].copy_from_slice(keypair.pubkey().as_ref());
-    sign_data[32..64].copy_from_slice(recipient);
-    sign_data[64..72].copy_from_slice(&ts.to_le_bytes());
-    sign_data[72..76].copy_from_slice(&nonce.to_le_bytes());
-    let sig = keypair.sign_message(&sign_data);
-    buf[4..68].copy_from_slice(sig.as_ref());
-    buf
-}
 
 /// Load a Solana keypair JSON file, or generate a fresh one and save it so
 /// gossip identity survives restarts. Format is the standard Solana JSON array
@@ -768,7 +742,7 @@ fn main() -> Result<()> {
                         let sent_before = total_sent;
                         for &idx in &batch {
                             for (pk, addr) in &targets {
-                                let req = repair_window_index(
+                                let req = repair_wire::window_index(
                                     &keypair_repair, pk, slot, idx as u64, nonce,
                                 );
                                 match repair_sock.send_to(&req, addr) {

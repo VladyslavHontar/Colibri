@@ -1,4 +1,5 @@
-//! Repair-socket wire codec: classify inbound packets and build Pong replies.
+//! Repair-socket wire codec: classify inbound packets, build Pong replies,
+//! and encode outbound repair requests.
 //!
 //! # Wire layout (authoritative: docs/repair-wire-format.md)
 //!
@@ -14,6 +15,18 @@
 //!   [36..68] Pong.hash = SHA-256("SOLANA_PING_PONG" ++ token)
 //!   [68..132] Pong.signature = sign(hash_bytes)
 //!
+//! Outbound repair request common header (offsets shared by all three):
+//!   [0..4]    discriminant (LE u32)
+//!   [4..68]   signature (64 bytes, written after signing)
+//!   [68..100] sender pubkey (32 bytes)
+//!   [100..132] recipient pubkey (32 bytes)
+//!   [132..140] timestamp (u64 LE)
+//!   [140..144] nonce (u32 LE)
+//!   then variant-specific trailing fields.
+//!
+//! Signed bytes (agave canonical, all modern request types):
+//!   sign_data = buf[0..4] ++ buf[68..]   (discriminant ‖ everything after sig)
+//!
 //! SHA-256 path: manual implementation using `sha2` crate.
 //! (`solana_gossip::ping_pong::Pong::new` is available but requires constructing
 //! a `Ping<32>` object, while `RepairResponse` is in `solana-core` which is not
@@ -23,7 +36,29 @@ use {
     sha2::{Digest, Sha256},
     solana_keypair::Keypair,
     solana_signer::Signer,
+    solana_time_utils::timestamp,
 };
+
+// ─── repair request constants ────────────────────────────────────────────────
+
+/// Discriminant for `RepairProtocol::WindowIndex` (modern, ordinal 8).
+pub const WINDOW_INDEX_DISCRIMINANT: u32 = 8;
+/// Discriminant for `RepairProtocol::HighestWindowIndex` (modern, ordinal 9).
+pub const HIGHEST_DISCRIMINANT: u32 = 9;
+/// Discriminant for `RepairProtocol::Orphan` (modern, ordinal 10).
+pub const ORPHAN_DISCRIMINANT: u32 = 10;
+
+/// Wire length of a `WindowIndex` request (160 bytes).
+pub const WINDOW_INDEX_WIRE_LEN: usize = 160;
+/// Wire length of a `HighestWindowIndex` request (160 bytes).
+pub const HIGHEST_WIRE_LEN: usize = 160;
+/// Wire length of an `Orphan` request (152 bytes, no shred_index field).
+pub const ORPHAN_WIRE_LEN: usize = 152;
+
+/// Byte offset of `header.sender` in all outbound repair request packets.
+pub const SENDER_OFF: usize = 68;
+/// Byte offset of `header.recipient` in all outbound repair request packets.
+pub const RECIPIENT_OFF: usize = 100;
 
 /// Total byte length of an outbound Pong packet.
 pub const PONG_WIRE_LEN: usize = 132;
@@ -106,6 +141,107 @@ pub fn build_pong(keypair: &Keypair, token: [u8; 32]) -> Vec<u8> {
     pong
 }
 
+// ─── outbound repair request encoders ───────────────────────────────────────
+
+/// Encode a `RepairProtocol::WindowIndex` request (discriminant 8, 160 bytes).
+///
+/// Wire layout per `docs/repair-wire-format.md`:
+///   [0..4]    discriminant = 8
+///   [4..68]   signature (computed and written last)
+///   [68..100] sender pubkey
+///   [100..132] recipient pubkey
+///   [132..140] timestamp (u64 LE)
+///   [140..144] nonce (u32 LE)
+///   [144..152] slot (u64 LE)
+///   [152..160] shred_index (u64 LE)
+///
+/// Signed bytes (agave canonical): `buf[0..4] ++ buf[68..]` = 96 bytes.
+pub fn window_index(
+    keypair:     &Keypair,
+    recipient:   &[u8; 32],
+    slot:        u64,
+    shred_index: u64,
+    nonce:       u32,
+) -> Vec<u8> {
+    let ts = timestamp();
+    let mut buf = vec![0u8; WINDOW_INDEX_WIRE_LEN];
+    buf[0..4].copy_from_slice(&WINDOW_INDEX_DISCRIMINANT.to_le_bytes());
+    // signature region [4..68] left zero until signing
+    buf[SENDER_OFF..SENDER_OFF + 32].copy_from_slice(keypair.pubkey().as_ref());
+    buf[RECIPIENT_OFF..RECIPIENT_OFF + 32].copy_from_slice(recipient);
+    buf[132..140].copy_from_slice(&ts.to_le_bytes());
+    buf[140..144].copy_from_slice(&nonce.to_le_bytes());
+    buf[144..152].copy_from_slice(&slot.to_le_bytes());
+    buf[152..160].copy_from_slice(&shred_index.to_le_bytes());
+    let sign_data: Vec<u8> = [&buf[0..4], &buf[68..]].concat();
+    let sig = keypair.sign_message(&sign_data);
+    buf[4..68].copy_from_slice(sig.as_ref());
+    buf
+}
+
+/// Encode a `RepairProtocol::HighestWindowIndex` request (discriminant 9, 160 bytes).
+///
+/// Wire layout is identical to `window_index` but with discriminant 9.
+/// Used to discover the last shred index in a slot when we hold zero shreds.
+///
+/// Signed bytes (agave canonical): `buf[0..4] ++ buf[68..]` = 96 bytes.
+pub fn highest_window_index(
+    keypair:     &Keypair,
+    recipient:   &[u8; 32],
+    slot:        u64,
+    shred_index: u64,
+    nonce:       u32,
+) -> Vec<u8> {
+    let ts = timestamp();
+    let mut buf = vec![0u8; HIGHEST_WIRE_LEN];
+    buf[0..4].copy_from_slice(&HIGHEST_DISCRIMINANT.to_le_bytes());
+    // signature region [4..68] left zero until signing
+    buf[SENDER_OFF..SENDER_OFF + 32].copy_from_slice(keypair.pubkey().as_ref());
+    buf[RECIPIENT_OFF..RECIPIENT_OFF + 32].copy_from_slice(recipient);
+    buf[132..140].copy_from_slice(&ts.to_le_bytes());
+    buf[140..144].copy_from_slice(&nonce.to_le_bytes());
+    buf[144..152].copy_from_slice(&slot.to_le_bytes());
+    buf[152..160].copy_from_slice(&shred_index.to_le_bytes());
+    let sign_data: Vec<u8> = [&buf[0..4], &buf[68..]].concat();
+    let sig = keypair.sign_message(&sign_data);
+    buf[4..68].copy_from_slice(sig.as_ref());
+    buf
+}
+
+/// Encode a `RepairProtocol::Orphan` request (discriminant 10, 152 bytes).
+///
+/// Wire layout per `docs/repair-wire-format.md`:
+///   [0..4]    discriminant = 10
+///   [4..68]   signature (computed and written last)
+///   [68..100] sender pubkey
+///   [100..132] recipient pubkey
+///   [132..140] timestamp (u64 LE)
+///   [140..144] nonce (u32 LE)
+///   [144..152] slot (u64 LE)
+///
+/// Signed bytes (agave canonical): `buf[0..4] ++ buf[68..]` = 88 bytes.
+/// No `shred_index` field — used to pull a parent chain for a given slot.
+pub fn orphan(
+    keypair:   &Keypair,
+    recipient: &[u8; 32],
+    slot:      u64,
+    nonce:     u32,
+) -> Vec<u8> {
+    let ts = timestamp();
+    let mut buf = vec![0u8; ORPHAN_WIRE_LEN];
+    buf[0..4].copy_from_slice(&ORPHAN_DISCRIMINANT.to_le_bytes());
+    // signature region [4..68] left zero until signing
+    buf[SENDER_OFF..SENDER_OFF + 32].copy_from_slice(keypair.pubkey().as_ref());
+    buf[RECIPIENT_OFF..RECIPIENT_OFF + 32].copy_from_slice(recipient);
+    buf[132..140].copy_from_slice(&ts.to_le_bytes());
+    buf[140..144].copy_from_slice(&nonce.to_le_bytes());
+    buf[144..152].copy_from_slice(&slot.to_le_bytes());
+    let sign_data: Vec<u8> = [&buf[0..4], &buf[68..]].concat();
+    let sig = keypair.sign_message(&sign_data);
+    buf[4..68].copy_from_slice(sig.as_ref());
+    buf
+}
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 /// Build a synthetic `RepairResponse::Ping` wire packet for testing.
@@ -173,5 +309,77 @@ mod tests {
         let mut not_ping = vec![0u8; 132];
         not_ping[0] = 1; // discriminant != 0
         assert!(matches!(parse_inbound(&not_ping), Inbound::Other));
+    }
+
+    // ─── outbound repair request encoder tests ───────────────────────────────
+
+    #[test]
+    fn window_index_modern_layout() {
+        // Guards the move from main.rs and the modernization to discriminant 8.
+        let kp = Keypair::new();
+        let req = window_index(&kp, &[3u8; 32], 100, 5, 0xCC);
+        assert_eq!(req.len(), WINDOW_INDEX_WIRE_LEN);
+        assert_eq!(req.len(), 160);
+        assert_eq!(&req[0..4], &WINDOW_INDEX_DISCRIMINANT.to_le_bytes());
+        assert_eq!(&req[0..4], &8u32.to_le_bytes());
+        assert_eq!(&req[SENDER_OFF..SENDER_OFF + 32], kp.pubkey().as_ref());
+        assert_eq!(&req[RECIPIENT_OFF..RECIPIENT_OFF + 32], &[3u8; 32]);
+        // slot at [144..152]
+        assert_eq!(&req[144..152], &100u64.to_le_bytes());
+        // shred_index at [152..160]
+        assert_eq!(&req[152..160], &5u64.to_le_bytes());
+    }
+
+    #[test]
+    fn highest_window_index_layout_matches_spec() {
+        let kp = Keypair::new();
+        let rcpt = [1u8; 32];
+        let req = highest_window_index(&kp, &rcpt, 100, 5, 0xAA);
+        assert_eq!(req.len(), HIGHEST_WIRE_LEN);
+        assert_eq!(req.len(), 160);
+        assert_eq!(&req[0..4], &HIGHEST_DISCRIMINANT.to_le_bytes());
+        assert_eq!(&req[0..4], &9u32.to_le_bytes());
+        assert_eq!(&req[SENDER_OFF..SENDER_OFF + 32], kp.pubkey().as_ref());
+        assert_eq!(&req[RECIPIENT_OFF..RECIPIENT_OFF + 32], &rcpt);
+        // slot at [144..152]
+        assert_eq!(&req[144..152], &100u64.to_le_bytes());
+        // shred_index at [152..160]
+        assert_eq!(&req[152..160], &5u64.to_le_bytes());
+    }
+
+    #[test]
+    fn orphan_layout_matches_spec() {
+        let kp = Keypair::new();
+        let rcpt = [2u8; 32];
+        let req = orphan(&kp, &rcpt, 100, 0xBB);
+        assert_eq!(req.len(), ORPHAN_WIRE_LEN);
+        assert_eq!(req.len(), 152);
+        assert_eq!(&req[0..4], &ORPHAN_DISCRIMINANT.to_le_bytes());
+        assert_eq!(&req[0..4], &10u32.to_le_bytes());
+        assert_eq!(&req[SENDER_OFF..SENDER_OFF + 32], kp.pubkey().as_ref());
+        assert_eq!(&req[RECIPIENT_OFF..RECIPIENT_OFF + 32], &rcpt);
+        // slot at [144..152]
+        assert_eq!(&req[144..152], &100u64.to_le_bytes());
+    }
+
+    #[test]
+    fn window_index_sign_data_is_96_bytes_excl_sig() {
+        // Verify the sign_data construction: discriminant(4) ++ buf[68..] = 4 + 92 = 96 bytes
+        // for window_index (total 160 bytes; 160 - 68 = 92 bytes after sig region).
+        let kp = Keypair::new();
+        let req = window_index(&kp, &[0u8; 32], 1, 0, 0);
+        // sign_data length = 4 + (160 - 68) = 96
+        assert_eq!(req.len(), 160);
+        // The signature at [4..68] must not be all-zero (it was filled by sign_message)
+        assert_ne!(&req[4..68], &[0u8; 64][..]);
+    }
+
+    #[test]
+    fn orphan_sign_data_is_88_bytes_excl_sig() {
+        // sign_data length = 4 + (152 - 68) = 88 bytes for Orphan.
+        let kp = Keypair::new();
+        let req = orphan(&kp, &[0u8; 32], 1, 0);
+        assert_eq!(req.len(), 152);
+        assert_ne!(&req[4..68], &[0u8; 64][..]);
     }
 }
