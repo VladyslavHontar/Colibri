@@ -774,9 +774,9 @@ fn main() -> Result<()> {
                             let sig = tx.signatures.first()
                                 .map(|s| s.to_string()).unwrap_or_default();
                             if oracle_enabled_tvu && !sig.is_empty() {
-                                if let Ok(mut sm) = oracle_sig_map_tvu.try_lock() {
-                                    sm.entry(se.slot).or_insert_with(HashSet::new).insert(sig.clone());
-                                }
+                                oracle_sig_map_tvu.lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .entry(se.slot).or_insert_with(HashSet::new).insert(sig.clone());
                             }
                             if let Ok(raw) = bincode::serialize(tx) {
                                 let _ = tx_tx_tvu.send(ProtoTransaction {
@@ -817,9 +817,9 @@ fn main() -> Result<()> {
                                 let sig = tx.signatures.first()
                                     .map(|s| s.to_string()).unwrap_or_default();
                                 if oracle_enabled_tvu && !sig.is_empty() {
-                                    if let Ok(mut sm) = oracle_sig_map_tvu.try_lock() {
-                                        sm.entry(se.slot).or_insert_with(HashSet::new).insert(sig.clone());
-                                    }
+                                    oracle_sig_map_tvu.lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .entry(se.slot).or_insert_with(HashSet::new).insert(sig.clone());
                                 }
                                 if let Ok(raw) = bincode::serialize(tx) {
                                     let _ = tx_tx_tvu.send(ProtoTransaction {

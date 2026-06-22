@@ -45,40 +45,58 @@ pub struct SigDiff {
 /// { "result": { "signatures": ["AAA", "BBB", …] } }
 /// ```
 ///
-/// Returns a [`SigDiff`] with set-difference counts.  On JSON parse failure
-/// returns an all-zero diff (the caller decides whether to treat that as an
-/// error).
-pub fn diff_signatures(reconstructed: &HashSet<String>, rpc_block_json: &str) -> SigDiff {
-    let rpc_set = parse_rpc_signatures(rpc_block_json);
+/// Returns `Some(SigDiff)` with set-difference counts, or `None` when the
+/// block is unavailable (`{"result":null}`) or the response cannot be parsed.
+/// `None` signals "no block data" — the caller must NOT treat this as
+/// divergence; it counts it under `fetch_errors` / `skipped` instead.
+pub fn diff_signatures(reconstructed: &HashSet<String>, rpc_block_json: &str) -> Option<SigDiff> {
+    let rpc_set = parse_rpc_signatures(rpc_block_json)?;
 
-    let matched       = reconstructed.intersection(&rpc_set).count();
+    let matched         = reconstructed.intersection(&rpc_set).count();
     let missing_locally = rpc_set.difference(reconstructed).count();
     let extra_locally   = reconstructed.difference(&rpc_set).count();
 
-    SigDiff { matched, missing_locally, extra_locally }
+    Some(SigDiff { matched, missing_locally, extra_locally })
 }
 
 /// Parse `result.signatures` (flat array) from a `getBlock` JSON response.
-fn parse_rpc_signatures(json: &str) -> HashSet<String> {
+///
+/// Returns `None` when:
+/// - JSON parse fails (malformed body)
+/// - `result` is JSON `null` (slot skipped / not yet confirmed by the RPC node)
+/// - `result.signatures` is absent or not an array (unexpected shape)
+///
+/// Callers must treat `None` as "no block data available", not as divergence.
+fn parse_rpc_signatures(json: &str) -> Option<HashSet<String>> {
     let v: Value = match serde_json::from_str(json) {
         Ok(v)  => v,
         Err(e) => {
             eprintln!("[oracle] JSON parse error: {e}");
-            return HashSet::new();
+            return None;
         }
     };
+
+    // `getBlock` can legitimately return {"result":null} for skipped/missing
+    // slots.  Treat this as "no block" rather than empty-RPC-set so the caller
+    // never falsely counts local sigs as extra_locally divergence.
+    if v["result"].is_null() {
+        eprintln!("[oracle] result=null — slot skipped or not yet available on RPC");
+        return None;
+    }
 
     let arr = match v["result"]["signatures"].as_array() {
         Some(a) => a,
         None    => {
             eprintln!("[oracle] unexpected RPC shape: result.signatures not an array");
-            return HashSet::new();
+            return None;
         }
     };
 
-    arr.iter()
-        .filter_map(|s| s.as_str().map(|s| s.to_string()))
-        .collect()
+    Some(
+        arr.iter()
+            .filter_map(|s| s.as_str().map(|s| s.to_string()))
+            .collect()
+    )
 }
 
 // ── network fetch ─────────────────────────────────────────────────────────────
@@ -109,10 +127,15 @@ pub struct OracleSampler {
     /// How many targeted completions we have seen (used to determine sampling).
     pub completion_count: u64,
     // Accumulated totals across all sampled slots.
-    pub sampled:      u64,
-    pub matched:      u64,
+    /// Slots for which `fetch_block` returned `Some` AND `diff_signatures`
+    /// returned `Some` — i.e. slots we actually diffed.
+    pub sampled:       u64,
+    pub matched:       u64,
     pub missing_local: u64,
     pub extra_local:   u64,
+    /// Slots selected for sampling where we got no usable block data:
+    /// network timeout, RPC error, `result:null`, or unexpected JSON shape.
+    pub fetch_errors:  u64,
 }
 
 impl OracleSampler {
@@ -125,6 +148,7 @@ impl OracleSampler {
             matched: 0,
             missing_local: 0,
             extra_local: 0,
+            fetch_errors: 0,
         }
     }
 
@@ -133,22 +157,38 @@ impl OracleSampler {
     /// `sigs` = reconstructed transaction signatures for that slot.  If this
     /// slot is selected for sampling, fetches from RPC, diffs, and accumulates
     /// counters.  Logs loudly on any `missing_local > 0`.
+    ///
+    /// `sampled` is only incremented when `fetch_block` succeeds AND
+    /// `diff_signatures` returns `Some` (i.e. we actually compared signatures).
+    /// Any other outcome — network failure, `result:null`, bad JSON — increments
+    /// `fetch_errors` instead so the report stays honest.
     pub fn on_complete(&mut self, slot: u64, sigs: &HashSet<String>) {
         self.completion_count += 1;
         if self.completion_count % self.sample_every != 0 {
             return;
         }
 
-        self.sampled += 1;
         let json = match fetch_block(&self.rpc_url, slot) {
             Some(j) => j,
             None    => {
                 eprintln!("[oracle] slot={slot} fetch_block failed (RPC timeout or error)");
+                self.fetch_errors += 1;
                 return;
             }
         };
 
-        let d = diff_signatures(sigs, &json);
+        let d = match diff_signatures(sigs, &json) {
+            Some(d) => d,
+            None    => {
+                // result:null or unrecognised shape — not divergence, just skip
+                eprintln!("[oracle] slot={slot} skipped (null/unparseable block)");
+                self.fetch_errors += 1;
+                return;
+            }
+        };
+
+        // Only reach here when we have a real diff — count it as sampled.
+        self.sampled       += 1;
         self.matched       += d.matched as u64;
         self.missing_local += d.missing_locally as u64;
         self.extra_local   += d.extra_locally as u64;
@@ -170,8 +210,8 @@ impl OracleSampler {
     /// One-line summary for the final Ctrl-C report.
     pub fn report_line(&self) -> String {
         format!(
-            "oracle: sampled={} matched={} missing_local={} extra_local={}",
-            self.sampled, self.matched, self.missing_local, self.extra_local,
+            "oracle: sampled={} matched={} missing_local={} extra_local={} fetch_errors={}",
+            self.sampled, self.matched, self.missing_local, self.extra_local, self.fetch_errors,
         )
     }
 }
@@ -189,7 +229,7 @@ mod tests {
         // at result.signatures — NOT result.transactions[].transaction.signatures.
         let rpc = r#"{"result":{"signatures":["AAA","BBB"]}}"#;
         let local: HashSet<String> = ["AAA"].iter().map(|s| s.to_string()).collect();
-        let d = diff_signatures(&local, rpc);
+        let d = diff_signatures(&local, rpc).unwrap();
         assert_eq!(d.matched, 1);
         assert_eq!(d.missing_locally, 1); // BBB absent locally
         assert_eq!(d.extra_locally, 0);
@@ -199,7 +239,7 @@ mod tests {
     fn diff_detects_extra_locally() {
         let rpc = r#"{"result":{"signatures":["AAA"]}}"#;
         let local: HashSet<String> = ["AAA", "CCC"].iter().map(|s| s.to_string()).collect();
-        let d = diff_signatures(&local, rpc);
+        let d = diff_signatures(&local, rpc).unwrap();
         assert_eq!(d.matched, 1);
         assert_eq!(d.missing_locally, 0);
         assert_eq!(d.extra_locally, 1); // CCC extra locally
@@ -209,31 +249,41 @@ mod tests {
     fn diff_perfect_match() {
         let rpc = r#"{"result":{"signatures":["AAA","BBB","CCC"]}}"#;
         let local: HashSet<String> = ["AAA", "BBB", "CCC"].iter().map(|s| s.to_string()).collect();
-        let d = diff_signatures(&local, rpc);
+        let d = diff_signatures(&local, rpc).unwrap();
         assert_eq!(d.matched, 3);
         assert_eq!(d.missing_locally, 0);
         assert_eq!(d.extra_locally, 0);
     }
 
     #[test]
-    fn diff_malformed_json_empty_rpc_set() {
-        // On parse failure the RPC set is treated as empty:
-        // matched=0, missing_locally=0 (nothing in RPC to be missing),
-        // extra_locally = everything in local set.
+    fn diff_malformed_json_returns_none() {
+        // On parse failure diff_signatures returns None — not a SigDiff with
+        // extra_locally inflated by every local sig being "extra".
         let local: HashSet<String> = ["AAA"].iter().map(|s| s.to_string()).collect();
-        let d = diff_signatures(&local, "not-json");
-        assert_eq!(d.matched, 0);
-        assert_eq!(d.missing_locally, 0);
-        assert_eq!(d.extra_locally, 1); // "AAA" is extra since RPC set is empty
+        assert!(diff_signatures(&local, "not-json").is_none());
     }
 
     #[test]
     fn diff_empty_slot_both_empty() {
         let rpc = r#"{"result":{"signatures":[]}}"#;
         let local: HashSet<String> = HashSet::new();
-        let d = diff_signatures(&local, rpc);
+        let d = diff_signatures(&local, rpc).unwrap();
         assert_eq!(d.matched, 0);
         assert_eq!(d.missing_locally, 0);
         assert_eq!(d.extra_locally, 0);
+    }
+
+    /// Fix 3: `{"result":null}` must return None, never count local sigs as
+    /// extra_locally divergence.  This is the primary false-positive guard.
+    #[test]
+    fn diff_null_result_returns_none_not_extra_locally() {
+        let rpc = r#"{"result":null}"#;
+        // Even if we have local sigs, a null result is NOT divergence — it means
+        // the slot is skipped/missing on the RPC side.
+        let local: HashSet<String> = ["AAA", "BBB"].iter().map(|s| s.to_string()).collect();
+        assert!(
+            diff_signatures(&local, rpc).is_none(),
+            "null result must signal no-block, not extra_locally=2"
+        );
     }
 }
