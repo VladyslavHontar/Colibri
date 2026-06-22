@@ -25,6 +25,7 @@
 #![allow(deprecated)]
 
 mod server;
+mod repair_wire;
 
 use {
     anyhow::Result,
@@ -684,6 +685,8 @@ fn main() -> Result<()> {
             let mut responses: u64   = 0;
             let mut total_sent: u64  = 0;
             let mut send_errors: u64 = 0;
+            let mut pings_seen: u64  = 0;
+            let mut pongs_sent: u64  = 0;
             let mut last_log         = Instant::now();
             let mut recv_buf         = [0u8; 1500];
 
@@ -695,9 +698,22 @@ fn main() -> Result<()> {
                 let mut drain_count = 0usize;
                 while drain_count < 512 {
                     match repair_sock.recv_from(&mut recv_buf) {
-                        Ok((n, _)) => {
-                            responses += 1;
-                            let _ = repair_shred_tx.send(recv_buf[..n].to_vec());
+                        Ok((n, src)) => {
+                            match repair_wire::parse_inbound(&recv_buf[..n]) {
+                                repair_wire::Inbound::Ping(token) => {
+                                    pings_seen += 1;
+                                    let pong = repair_wire::build_pong(&keypair_repair, token);
+                                    match repair_sock.send_to(&pong, src) {
+                                        Ok(_) => pongs_sent += 1,
+                                        Err(e) => eprintln!("[repair] pong send_to {src} error: {e}"),
+                                    }
+                                }
+                                repair_wire::Inbound::ShredResponse => {
+                                    responses += 1;
+                                    let _ = repair_shred_tx.send(recv_buf[..n].to_vec());
+                                }
+                                repair_wire::Inbound::Other => { /* discard */ }
+                            }
                             drain_count += 1;
                         }
                         Err(_) => break,
@@ -783,6 +799,7 @@ fn main() -> Result<()> {
                         .count();
                     eprintln!(
                         "[repair] total_sent={total_sent} errors={send_errors} responses={responses} \
+                         pings_seen={pings_seen} pongs_sent={pongs_sent} \
                          t1_visible={}/{} peers={}",
                         t1_known, tier1.len(), all_peers.len()
                     );

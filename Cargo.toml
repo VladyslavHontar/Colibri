@@ -15,3 +15,8 @@ anyhow  = "1"
 [profile.release]
 lto           = "thin"
 codegen-units = 1
+
+# time-macros 0.2.27 uses `let chains` (Rust 2024 only); override time to use 0.3.36
+# which pins time-macros to 0.2.18 (Rust 2021 compatible).
+[patch.crates-io]
+time = { path = "/Users/newuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/time-0.3.36" }
