@@ -1,6 +1,5 @@
 # Workspace contains only the colibri binary.
-# The deshredder library lives at /Users/newuser/RustroverProjects/Deshreder/
-# as a standalone open-source crate.
+# The deshredder library is a standalone open-source crate published to crates.io.
 [workspace]
 members  = ["colibri"]
 resolver = "2"
@@ -16,7 +15,3 @@ anyhow  = "1"
 lto           = "thin"
 codegen-units = 1
 
-# time-macros 0.2.27 uses `let chains` (Rust 2024 only); override time to use 0.3.36
-# which pins time-macros to 0.2.18 (Rust 2021 compatible).
-[patch.crates-io]
-time = { path = "/Users/newuser/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/time-0.3.36" }

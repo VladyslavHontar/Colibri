@@ -666,9 +666,10 @@ fn main() -> Result<()> {
         Arc::new(Mutex::new(coverage::CoverageMeter::new()));
 
     // Atomic counters promoted from repair-thread-local so they survive to report time.
-    let arc_pings_seen: Arc<AtomicU64>  = Arc::new(AtomicU64::new(0));
-    let arc_pongs_sent: Arc<AtomicU64>  = Arc::new(AtomicU64::new(0));
-    let arc_responses:  Arc<AtomicU64>  = Arc::new(AtomicU64::new(0));
+    let arc_pings_seen:  Arc<AtomicU64>  = Arc::new(AtomicU64::new(0));
+    let arc_pongs_sent:  Arc<AtomicU64>  = Arc::new(AtomicU64::new(0));
+    let arc_pong_errors: Arc<AtomicU64>  = Arc::new(AtomicU64::new(0));
+    let arc_responses:   Arc<AtomicU64>  = Arc::new(AtomicU64::new(0));
 
     // Set of slots that reached genuine is_full() completion (not deadline eviction).
     // Written by the repair thread in the RepairAction::Complete arm (targeted only).
@@ -861,6 +862,7 @@ fn main() -> Result<()> {
         let meter_rep         = meter.clone();
         let arc_pings_rep     = arc_pings_seen.clone();
         let arc_pongs_rep     = arc_pongs_sent.clone();
+        let arc_pong_errs_rep = arc_pong_errors.clone();
         let arc_resp_rep      = arc_responses.clone();
         let completed_set_rep  = completed_set.clone();
         let oracle_sampler_rep = oracle_sampler.clone();
@@ -895,7 +897,10 @@ fn main() -> Result<()> {
                                     let pong = repair_wire::build_pong(&keypair_repair, token);
                                     match repair_sock.send_to(&pong, src) {
                                         Ok(_) => { arc_pongs_rep.fetch_add(1, Ordering::Relaxed); }
-                                        Err(e) => eprintln!("[repair] pong send_to {src} error: {e}"),
+                                        Err(e) => {
+                                            arc_pong_errs_rep.fetch_add(1, Ordering::Relaxed);
+                                            eprintln!("[repair] pong send_to {src} error: {e}");
+                                        }
                                     }
                                 }
                                 repair_wire::Inbound::ShredResponse => {
@@ -1137,8 +1142,8 @@ fn main() -> Result<()> {
     // targeted slots on Complete or deadline, and logs COMPLETE.  We mirror
     // that by monitoring the repair_map here.
 
-    let probe_depths_arc: Arc<Mutex<Vec<(u64, u64, Instant, Option<bool>)>>> =
-        // (depth, slot, enqueued_at, result)
+    let probe_depths_arc: Arc<Mutex<Vec<(u64, u64, Instant, Option<Instant>, Option<bool>)>>> =
+        // (depth, slot, enqueued_at, first_seen_in_map, result)
         Arc::new(Mutex::new(Vec::new()));
 
     {
@@ -1150,6 +1155,7 @@ fn main() -> Result<()> {
         let probe_depth       = cfg.probe_depth;
         let probe_win_max     = cfg.probe_window_max;
         let completed_set_c   = completed_set.clone();
+        let repair_map_coord  = repair_map.clone();
 
         std::thread::spawn(move || {
             // Wait until the TVU has seen at least one shred.
@@ -1197,7 +1203,7 @@ fn main() -> Result<()> {
                     if probe_slot < range_start || probe_slot > range_end {
                         q.push_back(probe_slot);
                     }
-                    pd.push((depth, probe_slot, Instant::now(), None));
+                    pd.push((depth, probe_slot, Instant::now(), None, None));
                     depth += 1000;
                 }
                 eprintln!("[harness] probe slots enqueued: {} depths", pd.len());
@@ -1210,12 +1216,11 @@ fn main() -> Result<()> {
                 sleep(Duration::from_secs(2));
 
                 let mut pd = probe_depths_c.lock().unwrap_or_else(|e| e.into_inner());
-                let all_settled = pd.iter().all(|(_, _, _, r)| r.is_some());
+                let all_settled = pd.iter().all(|(_, _, _, _, r)| r.is_some());
                 if all_settled { break; }
 
-                for (depth, slot, enqueued_at, result) in pd.iter_mut() {
+                for (depth, slot, _enqueued_at, first_seen_in_map, result) in pd.iter_mut() {
                     if result.is_some() { continue; }
-                    let elapsed = enqueued_at.elapsed();
                     // Check the completed_set first: only genuine is_full() completions
                     // are inserted there (not 30s deadline evictions).  A slot that times
                     // out is removed from repair_map at its 30s deadline but will NOT
@@ -1225,14 +1230,30 @@ fn main() -> Result<()> {
                         .unwrap_or_else(|e| e.into_inner())
                         .contains(slot);
                     if genuinely_complete {
+                        let elapsed = first_seen_in_map.map_or(0, |t: Instant| t.elapsed().as_millis() as u64);
                         *result = Some(true);
-                        eprintln!("[probe] depth={depth} slot={slot} COMPLETE (elapsed={}ms)", elapsed.as_millis());
-                    } else if elapsed >= Duration::from_secs(35) {
-                        // Wall-clock deadline independent of repair_map presence:
-                        // the slot's 30s repair deadline has passed and it was never
-                        // completed, so repair could not serve this depth.
-                        *result = Some(false);
-                        eprintln!("[probe] depth={depth} slot={slot} TIMED_OUT");
+                        eprintln!("[probe] depth={depth} slot={slot} COMPLETE (elapsed_since_insert={elapsed}ms)");
+                    } else {
+                        // Record first_seen_in_map the moment the coordinator observes
+                        // the slot present in repair_map.  The 35s deadline runs from
+                        // THAT instant, not from enqueue time, so deep probe slots that
+                        // wait in the queue are not penalised for queue-wait latency.
+                        if first_seen_in_map.is_none() {
+                            let in_map = repair_map_coord.try_lock()
+                                .map(|m| m.contains_key(slot))
+                                .unwrap_or(false);
+                            if in_map {
+                                *first_seen_in_map = Some(Instant::now());
+                            }
+                        }
+                        // Only start the 35s timeout once first seen in repair_map.
+                        if let Some(first) = *first_seen_in_map {
+                            if first.elapsed() >= Duration::from_secs(35) {
+                                *result = Some(false);
+                                eprintln!("[probe] depth={depth} slot={slot} TIMED_OUT");
+                            }
+                        }
+                        // Else: still pending insertion — stays None.
                     }
                     // Otherwise: still pending (None) — neither completed nor deadline-expired.
                 }
@@ -1242,7 +1263,7 @@ fn main() -> Result<()> {
             let pd = probe_depths_c.lock().unwrap_or_else(|e| e.into_inner());
             let mut deepest_ok: u64 = 0;
             let mut first_fail: Option<u64> = None;
-            for (depth, _slot, _, result) in pd.iter() {
+            for (depth, _slot, _, _, result) in pd.iter() {
                 match result {
                     Some(true)  => { if *depth > deepest_ok { deepest_ok = *depth; } }
                     Some(false) => { if first_fail.map_or(true, |f| *depth < f) { first_fail = Some(*depth); } }
@@ -1359,16 +1380,17 @@ fn main() -> Result<()> {
     // ── final report (printed on Ctrl-C) ─────────────────────────────────────
     {
         let rpt = meter.lock().unwrap_or_else(|e| e.into_inner()).report();
-        let pings_seen = arc_pings_seen.load(Ordering::Relaxed);
-        let pongs_sent = arc_pongs_sent.load(Ordering::Relaxed);
-        let responses  = arc_responses.load(Ordering::Relaxed);
+        let pings_seen  = arc_pings_seen.load(Ordering::Relaxed);
+        let pongs_sent  = arc_pongs_sent.load(Ordering::Relaxed);
+        let pong_errors = arc_pong_errors.load(Ordering::Relaxed);
+        let responses   = arc_responses.load(Ordering::Relaxed);
 
         // Determine probe window summary
         let probe_summary = {
             let pd = probe_depths_arc.lock().unwrap_or_else(|e| e.into_inner());
             let mut deepest_ok: u64 = 0;
             let mut first_fail: Option<u64> = None;
-            for (depth, _, _, result) in pd.iter() {
+            for (depth, _, _, _, result) in pd.iter() {
                 match result {
                     Some(true)  => { if *depth > deepest_ok { deepest_ok = *depth; } }
                     Some(false) => { if first_fail.map_or(true, |f| *depth < f) { first_fail = Some(*depth); } }
@@ -1382,7 +1404,7 @@ fn main() -> Result<()> {
             }
         };
 
-        let completeness_label = if rpt.completeness_pct >= 90.0 {
+        let completeness_label = if rpt.completeness_pct >= 99.9 {
             "GREEN"
         } else if rpt.completeness_pct >= 50.0 {
             "YELLOW"
@@ -1401,7 +1423,7 @@ fn main() -> Result<()> {
         eprintln!("  latency max:    {} ms", rpt.max_ms);
         eprintln!("  repair window:  {probe_summary}");
         eprintln!("  pings_seen:     {pings_seen}");
-        eprintln!("  pongs_sent:     {pongs_sent}");
+        eprintln!("  pongs_sent:     {pongs_sent}  pong_errors={pong_errors}");
         eprintln!("  responses:      {responses}");
         eprintln!("  uptime:         {}s", start.elapsed().as_secs());
         if let Ok(sampler_guard) = oracle_sampler.lock() {

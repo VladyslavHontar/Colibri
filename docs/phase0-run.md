@@ -100,10 +100,17 @@ Press **Ctrl-C**. Colibri prints the final report block before exiting:
 
 > **Important — `status:` is a coarse signal, not the final verdict.**
 > The `status:` line printed by the binary is a completeness-only threshold:
-> `completeness ≥ 90% → GREEN`, `≥ 50% → YELLOW`, else `RED`.
+> `completeness ≥ 99.9% → GREEN`, `≥ 50% → YELLOW`, else `RED`.
 > It does NOT incorporate `missing_local`, the oracle, or the repair-window
 > depth. Apply the full decision rule in the Decision Rule section manually —
 > it can downgrade a printed GREEN.
+>
+> **Note on window depth:** when `--probe-depth` is large, probe slots deep in
+> the queue wait behind the coverage range slots (drained 16/cycle). The 35s
+> completion deadline starts when the probe slot is first inserted into the
+> repair map, not at enqueue time, so queue-wait latency does not bias the
+> result — but the measured window depth is still a conservative lower bound
+> under a large `--probe-depth`.
 
 ```
 ════════════════════ COLIBRI COVERAGE REPORT ════════════════════
