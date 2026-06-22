@@ -256,11 +256,18 @@ fn parse_shred_header(buf: &[u8]) -> Option<ShredInfo> {
 }
 
 struct SlotRepairState {
-    have:         HashSet<u32>,
-    last_index:   Option<u32>,
-    first_seen:   Instant,
-    last_repair:  Instant,
-    repair_rounds: u32,
+    have:            HashSet<u32>,
+    last_index:      Option<u32>,
+    first_seen:      Instant,
+    last_repair:     Instant,
+    repair_rounds:   u32,
+    /// True when this slot was proactively targeted (not just turbine-observed).
+    /// Targeted slots use `target_deadline` instead of the 2-second turbine eviction.
+    targeted:        bool,
+    /// True after we have sent at least one HighestWindowIndex probe for this slot.
+    highest_probed:  bool,
+    /// Absolute deadline for targeted slots (30s from insertion).
+    target_deadline: Instant,
 }
 
 impl SlotRepairState {
@@ -272,10 +279,143 @@ impl SlotRepairState {
             first_seen: now,
             last_repair: now - Duration::from_secs(1),
             repair_rounds: 0,
+            targeted: false,
+            highest_probed: false,
+            target_deadline: now + Duration::from_secs(30),
         }
     }
+
+    fn new_targeted() -> Self {
+        let mut s = Self::new();
+        s.targeted = true;
+        s
+    }
+
+    /// Turbine-observed slots evict after 2 s; targeted slots live until
+    /// `is_full()` returns true or the 30-second deadline expires.
     fn is_done(&self) -> bool {
-        self.first_seen.elapsed() > Duration::from_secs(2)
+        if self.targeted {
+            self.is_full() || Instant::now() >= self.target_deadline
+        } else {
+            self.first_seen.elapsed() > Duration::from_secs(2)
+        }
+    }
+
+    /// True when every shred index 0..=last_index is present in `have`.
+    fn is_full(&self) -> bool {
+        self.last_index
+            .map_or(false, |l| (0..=l).all(|i| self.have.contains(&i)))
+    }
+}
+
+// ─── per-slot repair decision ────────────────────────────────────────────────
+
+/// Actions the repair driver may take for a single slot in one cycle.
+#[derive(Debug, PartialEq)]
+enum RepairAction {
+    /// Send `HighestWindowIndex(slot, 0)` to discover `last_index`.
+    ProbeHighest,
+    /// Send `WindowIndex(slot, i)` for each missing index.
+    RequestWindows(Vec<u32>),
+    /// Send `Orphan(slot)` — fallback when `last_index` remains unknown after
+    /// several rounds.
+    RequestOrphan,
+    /// Slot is fully assembled — remove from map.
+    Complete,
+    /// Nothing to do this round (waiting for HighestWindowIndex response).
+    Wait,
+}
+
+/// Pure, unit-testable repair-decision function.
+///
+/// # Arguments
+/// * `have`          — shred indices already received.
+/// * `last_index`    — highest shred index in the slot, or `None` if unknown.
+/// * `highest_probed`— whether we have already sent a `HighestWindowIndex`.
+/// * `repair_rounds` — how many repair cycles have elapsed for this slot.
+/// * `orphan_after`  — number of rounds after which we fall back to `Orphan`.
+fn next_repair_action(
+    have:           &HashSet<u32>,
+    last_index:     Option<u32>,
+    highest_probed: bool,
+    repair_rounds:  u32,
+    orphan_after:   u32,
+) -> RepairAction {
+    // Already complete?
+    if last_index.map_or(false, |l| (0..=l).all(|i| have.contains(&i))) {
+        return RepairAction::Complete;
+    }
+
+    match last_index {
+        None if !highest_probed => RepairAction::ProbeHighest,
+        None if repair_rounds >= orphan_after => RepairAction::RequestOrphan,
+        None => RepairAction::Wait,
+        Some(last) => {
+            let missing: Vec<u32> = (0..=last)
+                .filter(|i| !have.contains(i))
+                .take(128)
+                .collect();
+            if missing.is_empty() {
+                RepairAction::Complete
+            } else {
+                RepairAction::RequestWindows(missing)
+            }
+        }
+    }
+}
+
+// ─── unit tests for next_repair_action ──────────────────────────────────────
+
+#[cfg(test)]
+mod repair_action_tests {
+    use super::*;
+
+    fn empty() -> HashSet<u32> { HashSet::new() }
+    fn have(indices: &[u32]) -> HashSet<u32> { indices.iter().copied().collect() }
+
+    #[test]
+    fn probe_highest_when_no_last_index_and_not_probed() {
+        let action = next_repair_action(&empty(), None, false, 0, 5);
+        assert_eq!(action, RepairAction::ProbeHighest);
+    }
+
+    #[test]
+    fn wait_after_probe_until_orphan_threshold() {
+        // probed but rounds < orphan_after → Wait
+        assert_eq!(
+            next_repair_action(&empty(), None, true, 3, 5),
+            RepairAction::Wait,
+        );
+    }
+
+    #[test]
+    fn request_orphan_after_threshold() {
+        let action = next_repair_action(&empty(), None, true, 5, 5);
+        assert_eq!(action, RepairAction::RequestOrphan);
+    }
+
+    #[test]
+    fn complete_when_all_shreds_present() {
+        let full = have(&[0, 1, 2]);
+        let action = next_repair_action(&full, Some(2), false, 0, 5);
+        assert_eq!(action, RepairAction::Complete);
+    }
+
+    #[test]
+    fn request_windows_for_gaps() {
+        let partial = have(&[0, 2]); // missing index 1
+        let action = next_repair_action(&partial, Some(2), false, 0, 5);
+        assert_eq!(action, RepairAction::RequestWindows(vec![1]));
+    }
+
+    #[test]
+    fn request_windows_capped_at_128() {
+        // last_index = 200 → 201 shreds needed; we have none → should return ≤128
+        let action = next_repair_action(&empty(), Some(200), false, 0, 5);
+        match action {
+            RepairAction::RequestWindows(v) => assert!(v.len() <= 128),
+            other => panic!("expected RequestWindows, got {other:?}"),
+        }
     }
 }
 
@@ -508,6 +648,11 @@ fn main() -> Result<()> {
     let repair_map: Arc<Mutex<HashMap<u64, SlotRepairState>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    // Shared queue the measurement harness (Task 5) pushes target slots into.
+    // Each cycle the repair thread drains up to 16 new entries into `repair_map`.
+    let target_slots: Arc<Mutex<std::collections::VecDeque<u64>>> =
+        Arc::new(Mutex::new(std::collections::VecDeque::new()));
+
     let (entry_tx, _) = broadcast::channel::<ProtoEntry>(1_024);
     let entry_tx = Arc::new(entry_tx);
     let (tx_tx, _) = broadcast::channel::<ProtoTransaction>(8_192);
@@ -644,6 +789,7 @@ fn main() -> Result<()> {
         let keypair_repair   = keypair.clone();
         let exit_repair      = exit.clone();
         let repair_map_rep   = repair_map.clone();
+        let target_slots_rep = target_slots.clone();
         let tier1_repair     = tier1_pubkeys.clone();
         let repair_port      = cfg.repair_port;
         let repair_ip        = cfg.ip;
@@ -669,6 +815,7 @@ fn main() -> Result<()> {
             loop {
                 if exit_repair.load(Ordering::Relaxed) { break; }
 
+                // ── drain inbound (ping/pong + shred responses) ──────────────
                 let mut drain_count = 0usize;
                 while drain_count < 512 {
                     match repair_sock.recv_from(&mut recv_buf) {
@@ -684,6 +831,20 @@ fn main() -> Result<()> {
                                 }
                                 repair_wire::Inbound::ShredResponse => {
                                     responses += 1;
+                                    // Feed repaired shred back into repair_map so
+                                    // is_full() counts it (closes completeness undercount).
+                                    if let Some(info) = parse_shred_header(&recv_buf[..n]) {
+                                        if info.is_data {
+                                            if let Ok(mut map) = repair_map_rep.try_lock() {
+                                                if let Some(state) = map.get_mut(&info.slot) {
+                                                    state.have.insert(info.index);
+                                                    if info.last_in_slot {
+                                                        state.last_index = Some(info.index);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     let _ = repair_shred_tx.send(recv_buf[..n].to_vec());
                                 }
                                 repair_wire::Inbound::Other => { /* discard */ }
@@ -695,6 +856,22 @@ fn main() -> Result<()> {
                 }
 
                 sleep(Duration::from_millis(50));
+
+                // ── drain target_slots queue → insert new targeted entries ────
+                if let Ok(mut queue) = target_slots_rep.try_lock() {
+                    let mut inserted = 0usize;
+                    while inserted < 16 {
+                        match queue.pop_front() {
+                            Some(slot) => {
+                                if let Ok(mut map) = repair_map_rep.try_lock() {
+                                    map.entry(slot).or_insert_with(SlotRepairState::new_targeted);
+                                }
+                                inserted += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                }
 
                 // Score all peers, take top 20.
                 let tier1: Vec<(u64, [u8; 32])> = tier1_repair.lock()
@@ -724,44 +901,107 @@ fn main() -> Result<()> {
 
                 if targets.is_empty() { continue; }
 
-                // Scan for slots with gaps.
+                // ── per-slot repair dispatch (driven by next_repair_action) ──
                 let mut done_slots = Vec::new();
                 if let Ok(mut map) = repair_map_rep.try_lock() {
                     for (&slot, state) in map.iter_mut() {
                         if state.is_done() { done_slots.push(slot); continue; }
-                        let last = match state.last_index { Some(l) => l, None => continue };
-                        let missing: Vec<u32> = (0..=last)
-                            .filter(|i| !state.have.contains(i))
-                            .collect();
-                        if missing.is_empty() { done_slots.push(slot); continue; }
                         if state.last_repair.elapsed() < Duration::from_millis(50) { continue; }
-                        state.last_repair  = Instant::now();
-                        state.repair_rounds += 1;
 
-                        let batch: Vec<u32> = missing.into_iter().take(128).collect();
-                        let sent_before = total_sent;
-                        for &idx in &batch {
-                            for (pk, addr) in &targets {
-                                let req = repair_wire::window_index(
-                                    &keypair_repair, pk, slot, idx as u64, nonce,
+                        let action = next_repair_action(
+                            &state.have,
+                            state.last_index,
+                            state.highest_probed,
+                            state.repair_rounds,
+                            5, // fall back to Orphan after 5 rounds with no last_index
+                        );
+
+                        match action {
+                            RepairAction::Complete => {
+                                eprintln!(
+                                    "[repair] target slot={slot} COMPLETE indices={}",
+                                    state.have.len()
                                 );
-                                match repair_sock.send_to(&req, addr) {
-                                    Ok(_) => total_sent += 1,
-                                    Err(e) => {
-                                        send_errors += 1;
-                                        if send_errors <= 5 {
-                                            eprintln!("[repair] send_to {addr} error: {e}");
+                                done_slots.push(slot);
+                                continue;
+                            }
+                            RepairAction::Wait => continue,
+
+                            RepairAction::ProbeHighest => {
+                                state.last_repair  = Instant::now();
+                                state.repair_rounds += 1;
+                                state.highest_probed = true;
+                                for (pk, addr) in &targets {
+                                    let req = repair_wire::highest_window_index(
+                                        &keypair_repair, pk, slot, 0, nonce,
+                                    );
+                                    match repair_sock.send_to(&req, addr) {
+                                        Ok(_) => total_sent += 1,
+                                        Err(e) => {
+                                            send_errors += 1;
+                                            if send_errors <= 5 {
+                                                eprintln!("[repair] send_to {addr} error: {e}");
+                                            }
                                         }
                                     }
+                                    nonce = nonce.wrapping_add(1);
                                 }
-                                nonce = nonce.wrapping_add(1);
+                                eprintln!("[repair] slot={slot} ProbeHighest sent to {} peers", targets.len());
                             }
-                        }
-                        if state.repair_rounds <= 3 || state.repair_rounds % 10 == 0 {
-                            eprintln!(
-                                "[repair] slot={slot} round={} missing={} sent=+{}",
-                                state.repair_rounds, batch.len(), total_sent - sent_before,
-                            );
+
+                            RepairAction::RequestOrphan => {
+                                state.last_repair  = Instant::now();
+                                state.repair_rounds += 1;
+                                for (pk, addr) in &targets {
+                                    let req = repair_wire::orphan(
+                                        &keypair_repair, pk, slot, nonce,
+                                    );
+                                    match repair_sock.send_to(&req, addr) {
+                                        Ok(_) => total_sent += 1,
+                                        Err(e) => {
+                                            send_errors += 1;
+                                            if send_errors <= 5 {
+                                                eprintln!("[repair] send_to {addr} error: {e}");
+                                            }
+                                        }
+                                    }
+                                    nonce = nonce.wrapping_add(1);
+                                }
+                                eprintln!(
+                                    "[repair] slot={slot} round={} RequestOrphan sent to {} peers",
+                                    state.repair_rounds, targets.len()
+                                );
+                            }
+
+                            RepairAction::RequestWindows(batch) => {
+                                state.last_repair  = Instant::now();
+                                state.repair_rounds += 1;
+
+                                let sent_before = total_sent;
+                                for &idx in &batch {
+                                    for (pk, addr) in &targets {
+                                        let req = repair_wire::window_index(
+                                            &keypair_repair, pk, slot, idx as u64, nonce,
+                                        );
+                                        match repair_sock.send_to(&req, addr) {
+                                            Ok(_) => total_sent += 1,
+                                            Err(e) => {
+                                                send_errors += 1;
+                                                if send_errors <= 5 {
+                                                    eprintln!("[repair] send_to {addr} error: {e}");
+                                                }
+                                            }
+                                        }
+                                        nonce = nonce.wrapping_add(1);
+                                    }
+                                }
+                                if state.repair_rounds <= 3 || state.repair_rounds % 10 == 0 {
+                                    eprintln!(
+                                        "[repair] slot={slot} round={} missing={} sent=+{}",
+                                        state.repair_rounds, batch.len(), total_sent - sent_before,
+                                    );
+                                }
+                            }
                         }
                     }
                     for slot in done_slots { map.remove(&slot); }
@@ -782,6 +1022,11 @@ fn main() -> Result<()> {
             }
         });
     }
+
+    // `target_slots` is the shared queue Task 5 (measurement harness) will push
+    // historical target slots into.  Keep the Arc alive for the binary lifetime;
+    // a clone is already held by the repair thread above.
+    let _target_slots = target_slots;
 
     let start      = Instant::now();
     let mut last_peers  = start;
