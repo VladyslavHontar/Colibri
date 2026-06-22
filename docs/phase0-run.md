@@ -17,7 +17,8 @@ source for Lumen's `P2pRepairSource`?
 | Repair port (UDP 8210) | Inbound + outbound. Repair requests go out; shred responses come back here. |
 | UDP recv buffer | `sudo sysctl -w net.core.rmem_max=134217728` — without this the kernel silently drops shred bursts. Set permanently in `/etc/sysctl.conf`. Colibri sets `SO_RCVBUF=32MB` on the TVU socket but the kernel caps it at `rmem_max`. |
 | Rust toolchain | Stable Rust (edition 2021). `rustup update stable`. |
-| RPC endpoint | Any Solana mainnet RPC that supports `getBlock` with `transactionDetails:"signatures"`. Passed only to `--oracle-rpc`; no other RPC traffic is generated. |
+| RPC endpoint (oracle) | Any Solana mainnet RPC that supports `getBlock` with `transactionDetails:"signatures"`. Passed to `--oracle-rpc` for measurement cross-checks. |
+| RPC endpoint (stake) | Any Solana mainnet RPC that supports `getVoteAccounts`. Used by `--rpc` (defaults to `http://api.mainnet-beta.solana.com`) for stake-weighted Tier-1 peer selection. Queried at startup and every 10 min. Outbound traffic to this host will occur even if `--rpc` is not explicitly set. |
 
 ---
 
@@ -69,8 +70,8 @@ give preference to peers they already know.
 | `--shred-version <VER>` | 50093 | Mainnet shred version (auto-probed from entrypoint) |
 | `--probe-depth <N>` | 6000 | Slots back from tip for the coverage range |
 | `--probe-window-max <N>` | 50000 | Maximum depth for the repair-window probe (probed in 1000-slot steps) |
-| `--oracle-rpc <URL>` | (none) | **Measurement-only.** Enables RPC cross-check: samples 1-in-50 completed slots via `getBlock` to catch reconstruction bugs that self-certifying `is_full()` cannot detect. This is the sole RPC use in Phase 0; all other data flow is pure P2P. |
-| `--rpc <URL>` | mainnet default | Stake data for Tier-1 peer scoring (separate from `--oracle-rpc`) |
+| `--oracle-rpc <URL>` | (none) | **Measurement-only.** The sole *measurement/correctness-oracle* RPC. Enables cross-check: samples 1-in-50 completed slots via `getBlock` to catch reconstruction bugs that self-certifying `is_full()` cannot detect. |
+| `--rpc <URL>` | `http://api.mainnet-beta.solana.com` | Polled via `getVoteAccounts` at startup and every 10 min for stake-weighted Tier-1 repair peer selection. Independent of `--oracle-rpc`. NOTE: this stake-via-RPC is a Phase-0-spike convenience only — the production `P2pRepairSource` in Lumen derives stake from executed LMDB state, so the production path remains pure-P2P. The coverage result is unaffected by where stake weights come from. |
 | `--tier1-fanout <N>` | 200 | How many top-staked validators to target for repairs |
 
 **Recommended run duration:** at least 10–15 minutes to let gossip converge
@@ -85,7 +86,7 @@ observes the first turbine shred; each slot has a 30-second repair deadline.
 Progress is printed to stderr. Key lines to watch:
 
 - `[tvu] shreds=… published=… tip=…` — turbine is flowing
-- `[gossip] peers: … (Tier-1 visible: N/200)` — gossip health; need T1 > 0
+- `[gossip] peers: … (Tier-1 visible: N/<tier1-fanout>)` — gossip health; need T1 > 0
 - `[repair] total_sent=… responses=…` — repair traffic is reaching validators
 - `[repair] target slot=… COMPLETE` — individual slot success
 - `[probe] depth=… slot=… COMPLETE` / `TIMED_OUT` — window probe results
@@ -96,6 +97,13 @@ Progress is printed to stderr. Key lines to watch:
 ## 6. Stop and Read the Report
 
 Press **Ctrl-C**. Colibri prints the final report block before exiting:
+
+> **Important — `status:` is a coarse signal, not the final verdict.**
+> The `status:` line printed by the binary is a completeness-only threshold:
+> `completeness ≥ 90% → GREEN`, `≥ 50% → YELLOW`, else `RED`.
+> It does NOT incorporate `missing_local`, the oracle, or the repair-window
+> depth. Apply the full decision rule in the Decision Rule section manually —
+> it can downgrade a printed GREEN.
 
 ```
 ════════════════════ COLIBRI COVERAGE REPORT ════════════════════
@@ -174,7 +182,7 @@ All three conditions must hold for **GREEN**:
 | Verdict | Conditions | Next step |
 |---|---|---|
 | **GREEN** | `missing_local == 0` AND `completeness ≥ 99.9%` AND `window_depth > 6000` | Build production `P2pRepairSource` in Lumen (Phase 1 plan). |
-| **YELLOW** | High completeness (≥ 99.9%) but `window_depth ≤ probe_depth`, OR `missing_local > 0` with otherwise clean numbers | For window shortfall: add a snapshot-freshness guarantee (ensure Lumen only requests slots within the proven window) and revise Phase 1 accordingly. For reconstruction bugs: fix the bug, re-run. |
+| **YELLOW** | `missing_local > 0` (forces at least YELLOW regardless of all other numbers), OR `completeness ≥ 99.9%` but `window_depth ≤ probe_depth` | For reconstruction bugs (`missing_local > 0`): fix the bug, re-run. For window shortfall: add a snapshot-freshness guarantee (ensure Lumen only requests slots within the proven window) and revise Phase 1 accordingly. |
 | **RED** | `completeness < ~100%` within the proven window — repair alone cannot reliably reconstruct slots | P2P repair alone is insufficient as a data source. Rethink the architecture (e.g. hybrid approach with a fallback, or pre-fetch via a different mechanism). |
 
 > **Note on `missing_local > 0`:** the oracle samples 1 in 50 completed
