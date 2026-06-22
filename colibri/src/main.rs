@@ -413,7 +413,7 @@ mod repair_action_tests {
         // last_index = 200 → 201 shreds needed; we have none → should return ≤128
         let action = next_repair_action(&empty(), Some(200), false, 0, 5);
         match action {
-            RepairAction::RequestWindows(v) => assert!(v.len() <= 128),
+            RepairAction::RequestWindows(v) => assert_eq!(v.len(), 128),
             other => panic!("expected RequestWindows, got {other:?}"),
         }
     }
@@ -863,10 +863,17 @@ fn main() -> Result<()> {
                     while inserted < 16 {
                         match queue.pop_front() {
                             Some(slot) => {
-                                if let Ok(mut map) = repair_map_rep.try_lock() {
-                                    map.entry(slot).or_insert_with(SlotRepairState::new_targeted);
+                                match repair_map_rep.try_lock() {
+                                    Ok(mut map) => {
+                                        map.entry(slot).or_insert_with(SlotRepairState::new_targeted);
+                                        inserted += 1;
+                                    }
+                                    Err(_) => {
+                                        // Lock contention: put the slot back and stop for this cycle.
+                                        queue.push_front(slot);
+                                        break;
+                                    }
                                 }
-                                inserted += 1;
                             }
                             None => break,
                         }
@@ -918,10 +925,12 @@ fn main() -> Result<()> {
 
                         match action {
                             RepairAction::Complete => {
-                                eprintln!(
-                                    "[repair] target slot={slot} COMPLETE indices={}",
-                                    state.have.len()
-                                );
+                                if state.targeted {
+                                    eprintln!(
+                                        "[repair] target slot={slot} COMPLETE indices={}",
+                                        state.have.len()
+                                    );
+                                }
                                 done_slots.push(slot);
                                 continue;
                             }
