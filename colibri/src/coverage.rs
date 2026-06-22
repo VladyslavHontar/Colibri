@@ -51,6 +51,9 @@ impl CoverageMeter {
 
     /// Record that `slot` was completed at time `at`.
     ///
+    /// Precondition: `mark_targeted` must have been called for `slot` first;
+    /// completion of an unseen slot is silently ignored (no-op).
+    ///
     /// Idempotent: if the slot was already completed, the first completion time
     /// is kept and subsequent calls are ignored.
     pub fn mark_complete(&mut self, slot: u64, at: Instant) {
@@ -73,8 +76,8 @@ impl CoverageMeter {
     ///
     /// Percentiles are computed over per-slot durations
     /// (`completed_at − targeted_at`) for **completed** slots only, sorted
-    /// ascending, using the nearest-rank formula:
-    /// `index = ceil(p / 100 * n) − 1` (0-based).
+    /// ascending, using a floor-based formula:
+    /// `index = floor(p / 100 * n)` (0-based), clamped to `[0, n−1]`.
     pub fn report(&self) -> CoverageReport {
         let targeted  = self.slots.len() as u64;
         let completed = self.slots.values()
