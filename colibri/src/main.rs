@@ -773,8 +773,10 @@ fn main() -> Result<()> {
 
             while let Ok(bytes) = repair_shred_rx.try_recv() {
                 if let Some(se) = deshredder.push_raw(&bytes) {
-                    completed_set_tvu.lock().unwrap_or_else(|e| e.into_inner()).insert(se.slot);
-                    meter_tvu.lock().unwrap_or_else(|e| e.into_inner()).mark_complete(se.slot, Instant::now());
+                    if se.complete {
+                        completed_set_tvu.lock().unwrap_or_else(|e| e.into_inner()).insert(se.slot);
+                        meter_tvu.lock().unwrap_or_else(|e| e.into_inner()).mark_complete(se.slot, Instant::now());
+                    }
                     let _ = entry_tx_tvu.send(ProtoEntry {
                         slot:    se.slot,
                         entries: se.entries_bytes,
@@ -818,8 +820,10 @@ fn main() -> Result<()> {
                     }
 
                     if let Some(se) = deshredder.push_raw(&buf[..n]) {
-                        completed_set_tvu.lock().unwrap_or_else(|e| e.into_inner()).insert(se.slot);
-                        meter_tvu.lock().unwrap_or_else(|e| e.into_inner()).mark_complete(se.slot, Instant::now());
+                        if se.complete {
+                            completed_set_tvu.lock().unwrap_or_else(|e| e.into_inner()).insert(se.slot);
+                            meter_tvu.lock().unwrap_or_else(|e| e.into_inner()).mark_complete(se.slot, Instant::now());
+                        }
                         let _ = entry_tx_tvu.send(ProtoEntry {
                             slot:    se.slot,
                             entries: se.entries_bytes,
