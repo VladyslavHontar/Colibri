@@ -751,8 +751,10 @@ fn main() -> Result<()> {
     let observed_tip_tvu   = observed_tip.clone();
     let oracle_sig_map_tvu = oracle_sig_map.clone();
     let oracle_enabled_tvu = oracle_sampler.lock().unwrap().is_some();
+    let meter_tvu          = meter.clone();
+    let completed_set_tvu  = completed_set.clone();
     std::thread::spawn(move || {
-        let mut deshredder    = Deshredder::new(3_000, 200);
+        let mut deshredder    = Deshredder::new(30_000, 200);
         let mut buf           = [0u8; 1280];
         let mut total: u64    = 0;
         let mut published: u64 = 0;
@@ -771,6 +773,8 @@ fn main() -> Result<()> {
 
             while let Ok(bytes) = repair_shred_rx.try_recv() {
                 if let Some(se) = deshredder.push_raw(&bytes) {
+                    completed_set_tvu.lock().unwrap_or_else(|e| e.into_inner()).insert(se.slot);
+                    meter_tvu.lock().unwrap_or_else(|e| e.into_inner()).mark_complete(se.slot, Instant::now());
                     let _ = entry_tx_tvu.send(ProtoEntry {
                         slot:    se.slot,
                         entries: se.entries_bytes,
@@ -814,6 +818,8 @@ fn main() -> Result<()> {
                     }
 
                     if let Some(se) = deshredder.push_raw(&buf[..n]) {
+                        completed_set_tvu.lock().unwrap_or_else(|e| e.into_inner()).insert(se.slot);
+                        meter_tvu.lock().unwrap_or_else(|e| e.into_inner()).mark_complete(se.slot, Instant::now());
                         let _ = entry_tx_tvu.send(ProtoEntry {
                             slot:    se.slot,
                             entries: se.entries_bytes,
@@ -936,23 +942,20 @@ fn main() -> Result<()> {
 
                 sleep(Duration::from_millis(50));
 
-                // ── drain target_slots queue → insert new targeted entries ────
-                if let Ok(mut queue) = target_slots_rep.try_lock() {
-                    let mut inserted = 0usize;
-                    while inserted < 16 {
+                // Window: keep at most TARGET_WINDOW targeted slots in flight so we
+                // don't thrash thousands at once (which evicts them before their
+                // shreds arrive). Completed/timed-out slots free up room each cycle.
+                const TARGET_WINDOW: usize = 256;
+                if let (Ok(mut map), Ok(mut queue)) =
+                    (repair_map_rep.try_lock(), target_slots_rep.try_lock())
+                {
+                    let active = map.values().filter(|s| s.targeted).count();
+                    let mut room = TARGET_WINDOW.saturating_sub(active);
+                    while room > 0 {
                         match queue.pop_front() {
                             Some(slot) => {
-                                match repair_map_rep.try_lock() {
-                                    Ok(mut map) => {
-                                        map.entry(slot).or_insert_with(SlotRepairState::new_targeted);
-                                        inserted += 1;
-                                    }
-                                    Err(_) => {
-                                        // Lock contention: put the slot back and stop for this cycle.
-                                        queue.push_front(slot);
-                                        break;
-                                    }
-                                }
+                                map.entry(slot).or_insert_with(SlotRepairState::new_targeted);
+                                room -= 1;
                             }
                             None => break,
                         }
@@ -990,8 +993,10 @@ fn main() -> Result<()> {
                 // ── per-slot repair dispatch (driven by next_repair_action) ──
                 let mut done_slots = Vec::new();
                 if let Ok(mut map) = repair_map_rep.try_lock() {
+                    let completed_now: std::collections::HashSet<u64> =
+                        completed_set_rep.lock().unwrap_or_else(|e| e.into_inner()).clone();
                     for (&slot, state) in map.iter_mut() {
-                        if state.is_done() { done_slots.push(slot); continue; }
+                        if state.is_done() || completed_now.contains(&slot) { done_slots.push(slot); continue; }
                         if state.last_repair.elapsed() < Duration::from_millis(50) { continue; }
 
                         let action = next_repair_action(
