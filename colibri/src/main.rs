@@ -532,15 +532,15 @@ fn main() -> Result<()> {
         }
     };
 
+    // Advertise ONLY gossip + tvu. colibri serves no RPC/TPU, and as a repair
+    // REQUESTER it receives shred responses on its repair socket (the source of
+    // its requests), so it need not advertise serve_repair. Advertising sockets
+    // it doesn't serve makes peers' ContactInfo sanitize reject the pull,
+    // silently dropping it — which stalled gossip bootstrap entirely.
     let mut ci = ContactInfo::new(keypair.pubkey(), timestamp(), shred_version);
     ci.set_gossip(gossip_addr)?;
-    ci.set_rpc(SocketAddr::new(cfg.ip, rpc_port))?;
-    ci.set_tpu(SocketAddr::new(cfg.ip, tpu_port))?;
     ci.set_tvu(Protocol::UDP, tvu_addr)?;
-    match ci.set_serve_repair(Protocol::UDP, repair_addr) {
-        Ok(_)  => eprintln!("[colibri] serve_repair:  {repair_addr} ✓"),
-        Err(e) => eprintln!("[colibri] serve_repair:  {repair_addr} FAILED: {e}"),
-    }
+    let _ = (rpc_port, tpu_port, repair_addr); // bound/advertised-elsewhere; not in ContactInfo
 
     let cluster_info = Arc::new(ClusterInfo::new(
         ci, keypair.clone(), SocketAddrSpace::Unspecified,
