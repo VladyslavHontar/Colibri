@@ -50,7 +50,7 @@ use {
         collections::{HashMap, HashSet},
         env,
         io::{Read as IoRead, Write as IoWrite},
-        net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket},
+        net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
         str::FromStr,
         collections::VecDeque,
         sync::{
@@ -474,19 +474,24 @@ fn main() -> Result<()> {
     eprintln!("[colibri] auth:          {}", if cfg.auth_token.is_some() { "token required" } else { "open (no auth)" });
     eprintln!("[colibri] tier1-fanout:  {}", cfg.tier1_fanout);
 
+    // Bind sockets on 0.0.0.0 (all interfaces) but advertise the public --ip.
+    // Binding to the specific DHCP-assigned public IP fails to receive the
+    // entrypoint's gossip replies on some hosts (e.g. OVH); 0.0.0.0 is the
+    // canonical agave pattern (matches Lumen's snapshot-fetch, which works).
+    let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     let (gport, gossip_socket) =
-        bind_in_range(cfg.ip, (cfg.port, cfg.port + 1))?;
+        bind_in_range(bind_ip, (cfg.port, cfg.port + 1))?;
     let gossip_addr = SocketAddr::new(cfg.ip, gport);
-    eprintln!("[colibri] gossip addr:   {gossip_addr}");
+    eprintln!("[colibri] gossip addr:   {gossip_addr} (socket bound on 0.0.0.0:{gport})");
     eprintln!("[diag] gossip socket local_addr: {:?}", gossip_socket.local_addr());
 
     let (rpc_port, _rpc_socket) =
-        bind_in_range(cfg.ip, (cfg.port + 1000, cfg.port + 1100))?;
+        bind_in_range(bind_ip, (cfg.port + 1000, cfg.port + 1100))?;
     let (tpu_port, _tpu_socket) =
-        bind_in_range(cfg.ip, (cfg.port + 1100, cfg.port + 1200))?;
+        bind_in_range(bind_ip, (cfg.port + 1100, cfg.port + 1200))?;
 
     let tvu_socket =
-        UdpSocket::bind(SocketAddr::new(cfg.ip, cfg.tvu_port))?;
+        UdpSocket::bind(SocketAddr::new(bind_ip, cfg.tvu_port))?;
     tvu_socket.set_read_timeout(Some(Duration::from_millis(10)))?;
     {
         #[cfg(unix)]
@@ -858,7 +863,7 @@ fn main() -> Result<()> {
         let target_slots_rep  = target_slots.clone();
         let tier1_repair      = tier1_pubkeys.clone();
         let repair_port       = cfg.repair_port;
-        let repair_ip         = cfg.ip;
+        let repair_ip         = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         let meter_rep         = meter.clone();
         let arc_pings_rep     = arc_pings_seen.clone();
         let arc_pongs_rep     = arc_pongs_sent.clone();
