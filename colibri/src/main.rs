@@ -266,7 +266,13 @@ fn parse_shred_header(buf: &[u8]) -> Option<ShredInfo> {
         0x80 | 0x90 | 0xB0 => true,
         _ => variant == 0xA5,
     };
-    let last_in_slot = is_data && variant != 0xA5 && (buf[85] & 0x40 != 0);
+    // buf[85] is the DataShredHeader flags byte. Per agave `ledger/src/shred.rs`
+    // ShredFlags: DATA_COMPLETE_SHRED = 0b0100_0000 (0x40) marks an entry-BATCH
+    // boundary, while LAST_SHRED_IN_SLOT = 0b1100_0000 (0xC0) marks the slot's
+    // final shred and *implies* DATA_COMPLETE_SHRED (both high bits set). Testing
+    // only 0x40 fires at every batch boundary, stopping repair at the first batch
+    // instead of slot end; require BOTH bits for the slot-end signal.
+    let last_in_slot = is_data && variant != 0xA5 && ((buf[85] & 0xC0) == 0xC0);
     Some(ShredInfo { slot, index, is_data, last_in_slot })
 }
 
@@ -431,6 +437,53 @@ mod repair_action_tests {
             RepairAction::RequestWindows(v) => assert_eq!(v.len(), 128),
             other => panic!("expected RequestWindows, got {other:?}"),
         }
+    }
+}
+
+// ─── unit tests for parse_shred_header last_in_slot (agave ShredFlags) ────────
+
+#[cfg(test)]
+mod shred_flag_tests {
+    use super::*;
+
+    /// Build a minimal 88-byte Merkle data-shred header with the given flags byte.
+    /// variant 0x80 = MerkleData (is_data && != 0xA5), slot/index arbitrary.
+    fn header_with_flags(flags: u8) -> [u8; 88] {
+        let mut buf = [0u8; 88];
+        buf[64] = 0x80; // ShredVariant::MerkleData
+        buf[65..73].copy_from_slice(&123u64.to_le_bytes()); // slot
+        buf[73..77].copy_from_slice(&7u32.to_le_bytes());   // index
+        buf[85] = flags;
+        buf
+    }
+
+    #[test]
+    fn data_complete_alone_is_not_last_in_slot() {
+        // 0x40 = DATA_COMPLETE_SHRED only → entry-batch boundary, NOT slot end.
+        let buf = header_with_flags(0x40);
+        let info = parse_shred_header(&buf).expect("parses");
+        assert!(info.is_data);
+        assert!(!info.last_in_slot, "DATA_COMPLETE_SHRED alone must not signal slot end");
+    }
+
+    #[test]
+    fn last_shred_in_slot_requires_both_bits() {
+        // 0xC0 = LAST_SHRED_IN_SLOT (implies DATA_COMPLETE_SHRED) → slot end.
+        let buf = header_with_flags(0xC0);
+        let info = parse_shred_header(&buf).expect("parses");
+        assert!(info.last_in_slot, "0xC0 must signal LAST_SHRED_IN_SLOT");
+    }
+
+    #[test]
+    fn reference_tick_bits_do_not_trigger_last_in_slot() {
+        // Low 6 bits are SHRED_TICK_REFERENCE_MASK; a high-tick value with only
+        // DATA_COMPLETE set (0x40 | 0x2A) must still not be slot end.
+        let buf = header_with_flags(0x40 | 0x2A);
+        let info = parse_shred_header(&buf).expect("parses");
+        assert!(!info.last_in_slot);
+        // But 0xC0 | tick bits IS slot end.
+        let buf2 = header_with_flags(0xC0 | 0x15);
+        assert!(parse_shred_header(&buf2).unwrap().last_in_slot);
     }
 }
 
