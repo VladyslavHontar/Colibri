@@ -11,6 +11,11 @@ path = "src/main.rs"
 # Deshredder — now a standalone library at the sibling repo.
 deshredder = { git = "https://github.com/VladyslavHontar/Deshreder.git" }
 
+# solana-ledger: reused ONLY for faithful shred sigverify (shred::layout merkle-root
+# extraction). agave-unstable-api exposes the `shred` module — same feature and
+# agave tag (v3.1.5) as deshredder, so no extra rocksdb build / native lib conflict.
+solana-ledger = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5", features = ["agave-unstable-api"] }
+
 # Gossip stack — agave v3.1.5, same tag as deshredder's solana-ledger.
 # Both share one rocksdb build (0.23) — no native library conflict.
 # GossipService::new takes Arc<[UdpSocket]> in agave (vs UdpSocket in jito fork).

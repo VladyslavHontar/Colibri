@@ -28,6 +28,7 @@ mod coverage;
 mod oracle;
 mod server;
 mod repair_wire;
+mod sigverify;
 
 use {
     anyhow::Result,
@@ -718,6 +719,18 @@ fn main() -> Result<()> {
         });
     }
 
+    // ── shred sigverify: leader schedule + counters ──────────────────────────
+    // Leader-keyed shred signature verification (agave verify_shred_cpu). The
+    // schedule covers the current epoch; the TVU thread verifies every shred
+    // against its slot leader before feeding the deshredder. See sigverify.rs
+    // for the fail-closed (known leader) vs admit-and-count (unknown leader,
+    // deep-probe stub boundary) policy.
+    let leader_sched: Arc<Mutex<sigverify::LeaderScheduleCache>> =
+        Arc::new(Mutex::new(sigverify::LeaderScheduleCache::new(cfg.rpc_url.clone())));
+    let sv_verified:   Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let sv_rejected:   Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let sv_no_leader:  Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
     // ── measurement harness shared state ─────────────────────────────────────
     let observed_tip: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let meter: Arc<Mutex<coverage::CoverageMeter>> =
@@ -797,8 +810,40 @@ fn main() -> Result<()> {
         eprintln!("[colibri] TLS:            disabled (plain gRPC)");
     }
 
+    // Leader-schedule refresh thread: initial fetch + re-fetch on epoch rollover.
+    {
+        let sched_refresh = leader_sched.clone();
+        let tip_refresh   = observed_tip.clone();
+        let exit_sched    = exit.clone();
+        std::thread::spawn(move || {
+            // Block for the first observed shred so getEpochInfo aligns with the
+            // slot we actually see, then fetch. (getEpochInfo works without it too;
+            // this just avoids a fetch before we know we are live.)
+            loop {
+                if exit_sched.load(Ordering::Relaxed) { return; }
+                let tip = tip_refresh.load(Ordering::Relaxed);
+                let did = sched_refresh.lock().unwrap_or_else(|e| e.into_inner())
+                    .refresh_if_stale(tip);
+                if did {
+                    let (a, b) = sched_refresh.lock().unwrap_or_else(|e| e.into_inner()).loaded_range();
+                    eprintln!("[sigverify] active schedule covers slots [{a}, {b})");
+                }
+                // Poll every 30s: cheap when in-epoch (refresh_if_stale is a no-op),
+                // re-fetches promptly on epoch rollover.
+                for _ in 0..30 {
+                    if exit_sched.load(Ordering::Relaxed) { return; }
+                    sleep(Duration::from_secs(1));
+                }
+            }
+        });
+    }
+
     let repair_map_tvu     = repair_map.clone();
     let exit_tvu           = exit.clone();
+    let leader_sched_tvu   = leader_sched.clone();
+    let sv_verified_tvu    = sv_verified.clone();
+    let sv_rejected_tvu    = sv_rejected.clone();
+    let sv_no_leader_tvu   = sv_no_leader.clone();
     let entry_tx_tvu       = entry_tx.clone();
     let tx_tx_tvu          = tx_tx.clone();
     let observed_tip_tvu   = observed_tip.clone();
@@ -816,6 +861,32 @@ fn main() -> Result<()> {
 
         eprintln!("[tvu] ready — inline deshredding, no UDP forward");
 
+        // Leader-keyed shred sigverify gate (agave verify_shred_cpu). Returns
+        // true if the shred may be ingested:
+        //   * leader known  → verify signature over the Merkle root; DROP on
+        //                      failure (fail-closed, == agave).
+        //   * leader unknown → ADMIT but count `sv_no_leader` (stub boundary for
+        //                      slots outside the loaded current epoch; see sigverify.rs).
+        let admit = |bytes: &[u8], slot: u64| -> bool {
+            let leader = leader_sched_tvu.lock().unwrap_or_else(|e| e.into_inner())
+                .leader_for_slot(slot);
+            match leader {
+                Some(pk) => {
+                    if sigverify::verify_shred_signature(bytes, &pk) {
+                        sv_verified_tvu.fetch_add(1, Ordering::Relaxed);
+                        true
+                    } else {
+                        sv_rejected_tvu.fetch_add(1, Ordering::Relaxed);
+                        false
+                    }
+                }
+                None => {
+                    sv_no_leader_tvu.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+            }
+        };
+
         loop {
             if exit_tvu.load(Ordering::Relaxed) { break; }
 
@@ -825,6 +896,12 @@ fn main() -> Result<()> {
             }
 
             while let Ok(bytes) = repair_shred_rx.try_recv() {
+                // Verify repaired shreds against the slot leader before ingest.
+                let slot = match parse_shred_header(&bytes) {
+                    Some(info) => info.slot,
+                    None => continue,
+                };
+                if !admit(&bytes, slot) { continue; }
                 if let Some(se) = deshredder.push_raw(&bytes) {
                     if se.complete {
                         completed_set_tvu.lock().unwrap_or_else(|e| e.into_inner()).insert(se.slot);
@@ -859,21 +936,31 @@ fn main() -> Result<()> {
                 Ok((n, _)) => {
                     total += 1;
 
-                    if let Some(info) = parse_shred_header(&buf[..n]) {
-                        observed_tip_tvu.fetch_max(info.slot, Ordering::Relaxed);
-                        if info.is_data {
-                            if let Ok(mut map) = repair_map_tvu.try_lock() {
-                                let state = map.entry(info.slot)
-                                    .or_insert_with(SlotRepairState::new);
-                                state.have.insert(info.index);
-                                if info.last_in_slot {
-                                    state.last_index = Some(info.index);
+                    // Sigverify BEFORE any state update: a forged shred must not
+                    // move observed_tip, seed repair_map, or reach the deshredder.
+                    let verified = match parse_shred_header(&buf[..n]) {
+                        Some(info) => {
+                            if admit(&buf[..n], info.slot) {
+                                observed_tip_tvu.fetch_max(info.slot, Ordering::Relaxed);
+                                if info.is_data {
+                                    if let Ok(mut map) = repair_map_tvu.try_lock() {
+                                        let state = map.entry(info.slot)
+                                            .or_insert_with(SlotRepairState::new);
+                                        state.have.insert(info.index);
+                                        if info.last_in_slot {
+                                            state.last_index = Some(info.index);
+                                        }
+                                    }
                                 }
+                                true
+                            } else {
+                                false
                             }
                         }
-                    }
+                        None => false,
+                    };
 
-                    if let Some(se) = deshredder.push_raw(&buf[..n]) {
+                    if verified { if let Some(se) = deshredder.push_raw(&buf[..n]) {
                         if se.complete {
                             completed_set_tvu.lock().unwrap_or_else(|e| e.into_inner()).insert(se.slot);
                             meter_tvu.lock().unwrap_or_else(|e| e.into_inner()).mark_complete(se.slot, Instant::now());
@@ -900,13 +987,17 @@ fn main() -> Result<()> {
                             }
                         }
                         published += 1;
-                    }
+                    } }
 
                     if last_log.elapsed() >= Duration::from_secs(10) {
                         let tip = observed_tip_tvu.load(Ordering::Relaxed);
+                        let sv_ok  = sv_verified_tvu.load(Ordering::Relaxed);
+                        let sv_bad = sv_rejected_tvu.load(Ordering::Relaxed);
+                        let sv_unk = sv_no_leader_tvu.load(Ordering::Relaxed);
                         eprintln!(
                             "[tvu] shreds={total} published={published} tip={tip} \
-                             assembler_slots={} dedup_slots={}",
+                             assembler_slots={} dedup_slots={} \
+                             sigverify[ok={sv_ok} rejected={sv_bad} no_leader={sv_unk}]",
                             deshredder.active_slot_count(),
                             deshredder.tracked_slot_count(),
                         );
@@ -1494,6 +1585,12 @@ fn main() -> Result<()> {
         eprintln!("  pings_seen:     {pings_seen}");
         eprintln!("  pongs_sent:     {pongs_sent}  pong_errors={pong_errors}");
         eprintln!("  responses:      {responses}");
+        eprintln!(
+            "  sigverify:      ok={} rejected={} no_leader={}",
+            sv_verified.load(Ordering::Relaxed),
+            sv_rejected.load(Ordering::Relaxed),
+            sv_no_leader.load(Ordering::Relaxed),
+        );
         eprintln!("  uptime:         {}s", start.elapsed().as_secs());
         if let Ok(sampler_guard) = oracle_sampler.lock() {
             if let Some(sampler) = sampler_guard.as_ref() {

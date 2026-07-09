@@ -1305,6 +1305,7 @@ dependencies = [
  "solana-gossip",
  "solana-hash 3.1.0",
  "solana-keypair",
+ "solana-ledger",
  "solana-net-utils",
  "solana-pubkey 3.0.0",
  "solana-signature",
