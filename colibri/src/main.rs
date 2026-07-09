@@ -831,8 +831,9 @@ fn main() -> Result<()> {
                         meter_tvu.lock().unwrap_or_else(|e| e.into_inner()).mark_complete(se.slot, Instant::now());
                     }
                     let _ = entry_tx_tvu.send(ProtoEntry {
-                        slot:    se.slot,
-                        entries: se.entries_bytes,
+                        slot:     se.slot,
+                        entries:  se.entries_bytes,
+                        complete: se.complete,
                     });
                     for entry in &se.entries {
                         for tx in &entry.transactions {
@@ -845,7 +846,7 @@ fn main() -> Result<()> {
                             }
                             if let Ok(raw) = bincode::serialize(tx) {
                                 let _ = tx_tx_tvu.send(ProtoTransaction {
-                                    slot: se.slot, signature: sig, raw_tx: raw,
+                                    slot: se.slot, signature: sig, raw_tx: raw, complete: se.complete,
                                 });
                             }
                         }
@@ -878,8 +879,9 @@ fn main() -> Result<()> {
                             meter_tvu.lock().unwrap_or_else(|e| e.into_inner()).mark_complete(se.slot, Instant::now());
                         }
                         let _ = entry_tx_tvu.send(ProtoEntry {
-                            slot:    se.slot,
-                            entries: se.entries_bytes,
+                            slot:     se.slot,
+                            entries:  se.entries_bytes,
+                            complete: se.complete,
                         });
                         for entry in &se.entries {
                             for tx in &entry.transactions {
@@ -892,7 +894,7 @@ fn main() -> Result<()> {
                                 }
                                 if let Ok(raw) = bincode::serialize(tx) {
                                     let _ = tx_tx_tvu.send(ProtoTransaction {
-                                        slot: se.slot, signature: sig, raw_tx: raw,
+                                        slot: se.slot, signature: sig, raw_tx: raw, complete: se.complete,
                                     });
                                 }
                             }
