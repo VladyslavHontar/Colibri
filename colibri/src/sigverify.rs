@@ -6,8 +6,9 @@
 //! can inject forged shreds; the deshredder will happily assemble them into fake
 //! entries and stream them to gRPC subscribers → corrupted downstream state.
 //! Agave verifies every shred against the slot leader's pubkey before ingest
-//! (`ledger/src/sigverify_shreds.rs::verify_shred_cpu`). This module reproduces
-//! that check.
+//! (`ledger/src/sigverify_shreds.rs::verify_shred_cpu`) and DROPS on failure or
+//! unknown leader. This module reproduces that check, and the ingest policy in
+//! `main.rs` reproduces agave's fail-closed stance for the production feed.
 //!
 //! # Scheme (faithful to agave `verify_shred_cpu` / `Shred::verify`)
 //!
@@ -26,29 +27,40 @@
 //!
 //! # Leader-schedule source (see `LeaderScheduleCache`)
 //!
-//! We derive the slot→leader map from the RPC pair `getEpochInfo` + `getLeaderSchedule`
-//! for the CURRENT epoch. This fully covers the steady-state shredstream / tip path
-//! (the money path Lumen replays), which is always inside the current epoch.
+//! The cache holds one leader map PER EPOCH, keyed by epoch number. It is bounded
+//! (`MAX_CACHED_EPOCHS`, oldest evicted). Epoch↔slot arithmetic comes from a single
+//! `getEpochSchedule` fetch (`EpochMath`), matching agave's `EpochSchedule`.
 //!
-//! ## Stubbed / known limitation (flagged for review)
+//! Two lookup/refresh phases, split so ingest NEVER blocks on an RPC round-trip:
+//!   * `leader_for_slot(slot)` — pure, in-memory. Returns the slot's leader if its
+//!     epoch schedule is loaded, else `None` AND records the missing epoch in a
+//!     `pending` set (so a background thread can fetch it). No I/O, no lock held
+//!     across a socket.
+//!   * `bootstrap` / `service_pending` — the background schedule thread calls these.
+//!     Each does its blocking RPC OUTSIDE the cache lock, then installs the result
+//!     under a brief lock. This is the mutex-across-RPC fix.
 //!
-//! `getLeaderSchedule` with no slot argument returns only the current epoch. Deep
-//! repair-coverage probes (thousands of slots back, Phase-0 harness) can fall into a
-//! PRIOR epoch for which we have no schedule loaded, so `leader_for_slot` returns
-//! `None`. The ingest policy (see `main.rs`) is therefore:
-//!   * leader known  → verify; DROP on signature failure (fail-closed, == agave).
-//!   * leader unknown → ADMIT but count as unverified (`shreds_unverified_no_leader`).
-//! The admit-on-unknown branch is the honest stub boundary: it keeps the Phase-0
-//! coverage harness working while enforcing real sigverify on the current-epoch tip
-//! path. TODO(prod): fetch per-epoch schedules on demand (`getLeaderSchedule(slot)`)
-//! and switch the unknown-leader branch to fail-closed for the production feed.
+//! # Ingest policy (enforced in `main.rs`, agave-faithful, fail-closed)
+//!   * leader known  → verify; DROP on signature failure (== agave).
+//!   * leader unknown (schedule not loaded / unfetchable epoch) → DROP; record the
+//!     epoch for on-demand fetch. The money path (deshredder → gRPC entry+tx stream)
+//!     NEVER emits an unverified shred, `observed_tip` NEVER advances from one, and
+//!     coverage NEVER completes from one. There is no admit-on-unknown branch.
 
 use {
     solana_ledger::shred::layout,
     solana_pubkey::Pubkey,
     solana_signature::Signature,
-    std::{str::FromStr, time::Instant},
+    std::{
+        collections::{HashMap, HashSet},
+        str::FromStr,
+    },
 };
+
+/// Upper bound on cached per-epoch schedules. The money path only needs the
+/// current epoch (plus the one just crossed at a boundary); the Phase-0 harness
+/// probes at most a few epochs back. Oldest epochs are evicted past this.
+const MAX_CACHED_EPOCHS: usize = 4;
 
 /// Verify a single shred's signature against the given slot leader.
 ///
@@ -73,183 +85,296 @@ pub fn verify_shred_signature(shred: &[u8], leader: &Pubkey) -> bool {
     sig.verify(leader.as_ref(), root.as_ref())
 }
 
-/// Slot→leader schedule for the current epoch, plus refresh bookkeeping.
+/// Epoch↔slot arithmetic, mirroring agave's `EpochSchedule` in the post-warmup
+/// (normal) regime. Sourced once from `getEpochSchedule`.
 ///
-/// Cheap to query (`leader_for_slot`); refreshed out-of-band via `refresh_if_stale`.
+/// Warmup epochs (`slot < first_normal_slot`) return `None` — they are ancient
+/// (mainnet left warmup years ago) and never fall in the tip or Phase-0 probe
+/// range; refusing them is fail-closed, not a functional gap.
+#[derive(Clone, Copy, Debug)]
+pub struct EpochMath {
+    slots_per_epoch:    u64,
+    first_normal_epoch: u64,
+    first_normal_slot:  u64,
+}
+
+impl EpochMath {
+    /// Epoch containing `slot`, or `None` if `slot` is in the warmup region.
+    pub fn epoch_of(&self, slot: u64) -> Option<u64> {
+        if self.slots_per_epoch == 0 || slot < self.first_normal_slot {
+            return None;
+        }
+        Some(self.first_normal_epoch + (slot - self.first_normal_slot) / self.slots_per_epoch)
+    }
+
+    /// Absolute first slot of `epoch`, or `None` for warmup epochs.
+    pub fn first_slot_of_epoch(&self, epoch: u64) -> Option<u64> {
+        if epoch < self.first_normal_epoch {
+            return None;
+        }
+        Some(self.first_normal_slot + (epoch - self.first_normal_epoch) * self.slots_per_epoch)
+    }
+}
+
+/// One epoch's slot→leader map.
+struct EpochLeaders {
+    first_slot: u64,
+    end_slot:   u64, // exclusive
+    leaders:    Vec<Pubkey>,
+}
+
+impl EpochLeaders {
+    fn leader_for_slot(&self, slot: u64) -> Option<Pubkey> {
+        if slot < self.first_slot || slot >= self.end_slot {
+            return None;
+        }
+        self.leaders.get((slot - self.first_slot) as usize).copied()
+    }
+}
+
+/// Per-epoch leader schedules + on-demand fetch bookkeeping.
+///
+/// Lookups are pure/in-memory; fetches are performed out-of-band by the
+/// background schedule thread (see module docs) so ingest never blocks on RPC.
 pub struct LeaderScheduleCache {
-    rpc_url: String,
-    /// Leaders indexed by `slot - epoch_first_slot`. Empty until first successful fetch.
-    leaders: Vec<Pubkey>,
-    epoch_first_slot: u64,
-    /// One-past-the-last absolute slot of the loaded epoch.
-    epoch_end_slot: u64,
-    last_fetch: Option<Instant>,
+    math:      Option<EpochMath>,
+    /// epoch → leader map. Bounded to `MAX_CACHED_EPOCHS` (oldest evicted).
+    schedules: HashMap<u64, EpochLeaders>,
+    /// Epochs a `leader_for_slot` miss asked for but which are not yet loaded.
+    /// Drained by the background thread.
+    pending:   HashSet<u64>,
+}
+
+impl Default for LeaderScheduleCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LeaderScheduleCache {
-    pub fn new(rpc_url: String) -> Self {
+    pub fn new() -> Self {
         Self {
-            rpc_url,
-            leaders: Vec::new(),
-            epoch_first_slot: 0,
-            epoch_end_slot: 0,
-            last_fetch: None,
+            math:      None,
+            schedules: HashMap::new(),
+            pending:   HashSet::new(),
         }
     }
 
-    /// Leader for `slot`, or `None` if the slot is outside the loaded epoch (or no
-    /// schedule has been fetched yet). `None` is the "unknown leader" signal the
-    /// ingest policy treats as unverified-but-admitted (see module docs).
-    pub fn leader_for_slot(&self, slot: u64) -> Option<Pubkey> {
-        if self.leaders.is_empty() || slot < self.epoch_first_slot || slot >= self.epoch_end_slot {
+    // ── pure, in-memory lookup (ingest hot path) ─────────────────────────────
+
+    /// Leader for `slot`, or `None` if unknown. On a miss (epoch not loaded) the
+    /// missing epoch is recorded in `pending` for the background thread to fetch.
+    /// Performs NO I/O and holds NO lock across a network call — safe to invoke
+    /// per-shred under the cache mutex.
+    pub fn leader_for_slot(&mut self, slot: u64) -> Option<Pubkey> {
+        let Some(math) = self.math else {
+            // Epoch math not bootstrapped yet → whole tip stream is unknown-leader
+            // and must be dropped (fail-closed). Background thread bootstraps ASAP.
             return None;
+        };
+        let Some(epoch) = math.epoch_of(slot) else {
+            return None; // warmup / nonsensical slot
+        };
+        match self.schedules.get(&epoch) {
+            Some(sched) => sched.leader_for_slot(slot),
+            None => {
+                self.pending.insert(epoch);
+                None
+            }
         }
-        let idx = (slot - self.epoch_first_slot) as usize;
-        self.leaders.get(idx).copied()
     }
 
-    /// True once a schedule for some epoch has been loaded.
-    #[allow(dead_code)] // public API; currently exercised only in tests
-    pub fn is_loaded(&self) -> bool {
-        !self.leaders.is_empty()
+    /// True once epoch math is known AND at least one epoch schedule is loaded.
+    /// Until then the money path emits nothing (fail-closed startup).
+    #[allow(dead_code)] // exercised in tests / diagnostics
+    pub fn is_ready(&self) -> bool {
+        self.math.is_some() && !self.schedules.is_empty()
     }
 
+    /// (min_first_slot, max_end_slot) across loaded epochs, for logging.
     pub fn loaded_range(&self) -> (u64, u64) {
-        (self.epoch_first_slot, self.epoch_end_slot)
+        let lo = self.schedules.values().map(|s| s.first_slot).min().unwrap_or(0);
+        let hi = self.schedules.values().map(|s| s.end_slot).max().unwrap_or(0);
+        (lo, hi)
     }
 
-    /// Fetch (or re-fetch) the current epoch's schedule if we have never fetched,
-    /// or `observed_slot` has moved into a new epoch. Returns `true` on a successful
-    /// (re)load. Network/parse failures leave the previous schedule intact.
-    pub fn refresh_if_stale(&mut self, observed_slot: u64) -> bool {
-        let need = self.leaders.is_empty()
-            || (observed_slot != 0 && observed_slot >= self.epoch_end_slot);
-        if !need {
-            return false;
+    // ── background-thread install/query helpers (brief locks only) ───────────
+
+    pub fn math(&self) -> Option<EpochMath> {
+        self.math
+    }
+
+    pub fn install_math(&mut self, math: EpochMath) {
+        self.math = Some(math);
+    }
+
+    pub fn has_epoch(&self, epoch: u64) -> bool {
+        self.schedules.contains_key(&epoch)
+    }
+
+    /// Install a freshly-fetched epoch schedule and evict the oldest epochs beyond
+    /// `MAX_CACHED_EPOCHS`. Also clears the epoch from `pending`.
+    pub fn install_epoch(&mut self, epoch: u64, first_slot: u64, end_slot: u64, leaders: Vec<Pubkey>) {
+        self.schedules.insert(epoch, EpochLeaders { first_slot, end_slot, leaders });
+        self.pending.remove(&epoch);
+        while self.schedules.len() > MAX_CACHED_EPOCHS {
+            if let Some(&oldest) = self.schedules.keys().min() {
+                self.schedules.remove(&oldest);
+            } else {
+                break;
+            }
         }
-        self.fetch_current_epoch()
     }
 
-    /// Fetch the current epoch's leader schedule via getEpochInfo + getLeaderSchedule.
-    fn fetch_current_epoch(&mut self) -> bool {
-        self.last_fetch = Some(Instant::now());
+    /// Take and clear the set of epochs awaiting fetch.
+    pub fn take_pending(&mut self) -> Vec<u64> {
+        let out: Vec<u64> = self.pending.iter().copied().collect();
+        self.pending.clear();
+        out
+    }
+}
 
-        // 1. getEpochInfo → absoluteSlot, slotIndex, slotsInEpoch.
-        let ei_body =
-            r#"{"jsonrpc":"2.0","id":1,"method":"getEpochInfo","params":[{"commitment":"confirmed"}]}"#;
-        let ei_resp = match crate::rpc_post(&self.rpc_url, ei_body) {
-            Some(r) => r,
-            None => {
-                eprintln!("[sigverify] getEpochInfo HTTP failed");
-                return false;
-            }
-        };
-        let ei: serde_json::Value = match serde_json::from_str(&ei_resp) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[sigverify] getEpochInfo parse error: {e}");
-                return false;
-            }
-        };
-        let (Some(absolute_slot), Some(slot_index), Some(slots_in_epoch)) = (
-            ei["result"]["absoluteSlot"].as_u64(),
-            ei["result"]["slotIndex"].as_u64(),
-            ei["result"]["slotsInEpoch"].as_u64(),
-        ) else {
-            eprintln!("[sigverify] getEpochInfo unexpected shape");
-            return false;
-        };
-        let epoch_first_slot = absolute_slot.saturating_sub(slot_index);
-        let epoch_end_slot = epoch_first_slot + slots_in_epoch;
+// ── free-function RPC fetchers (called by the background thread OUTSIDE the lock)
 
-        // 2. getLeaderSchedule (null slot → current epoch): { "<identity>": [idx, ...] }.
-        //    Indices are relative to epoch_first_slot.
-        let ls_body =
-            r#"{"jsonrpc":"2.0","id":1,"method":"getLeaderSchedule","params":[null]}"#;
-        let ls_resp = match crate::rpc_post(&self.rpc_url, ls_body) {
-            Some(r) => r,
-            None => {
-                eprintln!("[sigverify] getLeaderSchedule HTTP failed");
-                return false;
-            }
-        };
-        let ls: serde_json::Value = match serde_json::from_str(&ls_resp) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[sigverify] getLeaderSchedule parse error: {e}");
-                return false;
-            }
-        };
-        let map = match ls["result"].as_object() {
-            Some(m) => m,
-            None => {
-                eprintln!("[sigverify] getLeaderSchedule null/unexpected shape");
-                return false;
-            }
-        };
+/// Fetch `EpochMath` via `getEpochSchedule`. `None` on any failure (caller retries).
+pub fn fetch_epoch_math(rpc_url: &str) -> Option<EpochMath> {
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"getEpochSchedule","params":[]}"#;
+    let resp = crate::rpc_post(rpc_url, body)?;
+    let v: serde_json::Value = serde_json::from_str(&resp).ok()?;
+    let r = &v["result"];
+    let slots_per_epoch    = r["slotsPerEpoch"].as_u64()?;
+    let first_normal_epoch = r["firstNormalEpoch"].as_u64()?;
+    let first_normal_slot  = r["firstNormalSlot"].as_u64()?;
+    if slots_per_epoch == 0 {
+        return None;
+    }
+    Some(EpochMath { slots_per_epoch, first_normal_epoch, first_normal_slot })
+}
 
-        let mut leaders = vec![Pubkey::default(); slots_in_epoch as usize];
-        let mut filled: u64 = 0;
-        for (pubkey_str, indices) in map {
-            let pk = match Pubkey::from_str(pubkey_str) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if let Some(arr) = indices.as_array() {
-                for idx_v in arr {
-                    if let Some(idx) = idx_v.as_u64() {
-                        if (idx as usize) < leaders.len() {
-                            leaders[idx as usize] = pk;
-                            filled += 1;
-                        }
+/// Fetch the current absolute slot via `getEpochInfo` (used only to derive the
+/// current epoch number to preload at startup). `None` on failure.
+pub fn fetch_absolute_slot(rpc_url: &str) -> Option<u64> {
+    let body =
+        r#"{"jsonrpc":"2.0","id":1,"method":"getEpochInfo","params":[{"commitment":"confirmed"}]}"#;
+    let resp = crate::rpc_post(rpc_url, body)?;
+    let v: serde_json::Value = serde_json::from_str(&resp).ok()?;
+    v["result"]["absoluteSlot"].as_u64()
+}
+
+/// Fetch one epoch's leader map via `getLeaderSchedule(first_slot_of_epoch)`.
+///
+/// Returns `(first_slot, end_slot, leaders)` on success. Indices in the RPC reply
+/// are relative to the epoch's first slot; `leaders[i]` is the leader of
+/// `first_slot + i`. `None` if the RPC has no schedule for that epoch (e.g. a deep
+/// historical epoch it no longer serves) — the caller stays fail-closed for it.
+pub fn fetch_epoch_leaders(rpc_url: &str, epoch: u64, math: &EpochMath) -> Option<(u64, u64, Vec<Pubkey>)> {
+    let first_slot = math.first_slot_of_epoch(epoch)?;
+    let end_slot   = first_slot + math.slots_per_epoch;
+
+    // getLeaderSchedule takes a slot IN the target epoch and returns that epoch's
+    // schedule, keyed by validator identity → indices relative to its first slot.
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"getLeaderSchedule","params":[{first_slot}]}}"#
+    );
+    let resp = crate::rpc_post(rpc_url, &body)?;
+    let v: serde_json::Value = serde_json::from_str(&resp).ok()?;
+    let map = v["result"].as_object()?; // null result (unknown epoch) → None → fail-closed
+
+    let mut leaders = vec![Pubkey::default(); math.slots_per_epoch as usize];
+    let mut filled: u64 = 0;
+    for (pubkey_str, indices) in map {
+        let Ok(pk) = Pubkey::from_str(pubkey_str) else { continue };
+        if let Some(arr) = indices.as_array() {
+            for idx_v in arr {
+                if let Some(idx) = idx_v.as_u64() {
+                    if (idx as usize) < leaders.len() {
+                        leaders[idx as usize] = pk;
+                        filled += 1;
                     }
                 }
             }
         }
-
-        if filled == 0 {
-            eprintln!("[sigverify] getLeaderSchedule produced 0 assignments — keeping previous schedule");
-            return false;
-        }
-
-        self.leaders = leaders;
-        self.epoch_first_slot = epoch_first_slot;
-        self.epoch_end_slot = epoch_end_slot;
-        eprintln!(
-            "[sigverify] leader schedule loaded: epoch slots [{epoch_first_slot}, {epoch_end_slot}) \
-             assignments={filled}"
-        );
-        true
     }
+    if filled == 0 {
+        return None; // empty/unexpected → treat as unavailable, stay fail-closed
+    }
+    Some((first_slot, end_slot, leaders))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn leader_for_slot_bounds() {
-        let mut cache = LeaderScheduleCache::new("http://unused".into());
-        // Manually populate as if a schedule were fetched.
-        let a = Pubkey::new_unique();
-        let b = Pubkey::new_unique();
-        cache.leaders = vec![a, a, b, b];
-        cache.epoch_first_slot = 1000;
-        cache.epoch_end_slot = 1004;
-
-        assert_eq!(cache.leader_for_slot(999), None, "before epoch → None");
-        assert_eq!(cache.leader_for_slot(1000), Some(a));
-        assert_eq!(cache.leader_for_slot(1002), Some(b));
-        assert_eq!(cache.leader_for_slot(1003), Some(b));
-        assert_eq!(cache.leader_for_slot(1004), None, "at epoch_end (exclusive) → None");
-        assert_eq!(cache.leader_for_slot(9999), None, "far future → None");
+    fn math() -> EpochMath {
+        // Post-warmup mainnet-like: 432000 slots/epoch, first normal epoch 0.
+        EpochMath { slots_per_epoch: 432_000, first_normal_epoch: 0, first_normal_slot: 0 }
     }
 
     #[test]
-    fn unloaded_cache_returns_none() {
-        let cache = LeaderScheduleCache::new("http://unused".into());
-        assert!(!cache.is_loaded());
-        assert_eq!(cache.leader_for_slot(1000), None);
+    fn epoch_math_maps_slots_and_first_slots() {
+        let m = math();
+        assert_eq!(m.epoch_of(0), Some(0));
+        assert_eq!(m.epoch_of(431_999), Some(0));
+        assert_eq!(m.epoch_of(432_000), Some(1));
+        assert_eq!(m.epoch_of(864_001), Some(2));
+        assert_eq!(m.first_slot_of_epoch(0), Some(0));
+        assert_eq!(m.first_slot_of_epoch(1), Some(432_000));
+        assert_eq!(m.first_slot_of_epoch(2), Some(864_000));
+    }
+
+    #[test]
+    fn leader_for_slot_within_loaded_epoch() {
+        let mut cache = LeaderScheduleCache::new();
+        cache.install_math(math());
+        let a = Pubkey::new_unique();
+        let b = Pubkey::new_unique();
+        // epoch 1 spans [432000, 864000). Build a 4-slot toy at its head.
+        let mut leaders = vec![Pubkey::default(); 432_000];
+        leaders[0] = a; leaders[1] = a; leaders[2] = b; leaders[3] = b;
+        cache.install_epoch(1, 432_000, 864_000, leaders);
+
+        assert_eq!(cache.leader_for_slot(432_000), Some(a));
+        assert_eq!(cache.leader_for_slot(432_002), Some(b));
+        assert_eq!(cache.leader_for_slot(432_003), Some(b));
+        assert!(cache.is_ready());
+    }
+
+    #[test]
+    fn miss_records_pending_epoch_and_returns_none() {
+        let mut cache = LeaderScheduleCache::new();
+        cache.install_math(math());
+        // Slot in epoch 2, which is not loaded → None + pending{2}.
+        assert_eq!(cache.leader_for_slot(864_005), None);
+        assert_eq!(cache.take_pending(), vec![2]);
+        // Draining clears it.
+        assert!(cache.take_pending().is_empty());
+    }
+
+    #[test]
+    fn no_math_is_fail_closed() {
+        let mut cache = LeaderScheduleCache::new();
+        // Before bootstrap: every lookup is unknown → None (money path drops).
+        assert_eq!(cache.leader_for_slot(432_000), None);
+        assert!(!cache.is_ready());
+        // No math ⇒ we cannot even name the epoch, so nothing is queued.
+        assert!(cache.take_pending().is_empty());
+    }
+
+    #[test]
+    fn install_epoch_bounds_cache_and_evicts_oldest() {
+        let mut cache = LeaderScheduleCache::new();
+        cache.install_math(math());
+        for e in 0..(MAX_CACHED_EPOCHS as u64 + 2) {
+            let mut leaders = vec![Pubkey::default(); 432_000];
+            leaders[0] = Pubkey::new_unique();
+            let first = e * 432_000;
+            cache.install_epoch(e, first, first + 432_000, leaders);
+        }
+        assert_eq!(cache.schedules.len(), MAX_CACHED_EPOCHS);
+        // Oldest epochs (0, 1) evicted; newest retained.
+        assert!(!cache.has_epoch(0));
+        assert!(!cache.has_epoch(1));
+        assert!(cache.has_epoch(MAX_CACHED_EPOCHS as u64 + 1));
     }
 
     #[test]

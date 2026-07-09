@@ -277,6 +277,37 @@ fn parse_shred_header(buf: &[u8]) -> Option<ShredInfo> {
     Some(ShredInfo { slot, index, is_data, last_in_slot })
 }
 
+/// Apply a shred's side effects to `observed_tip` + `repair_map`, returning
+/// whether the shred should be pushed to the deshredder (i.e. emitted to the
+/// gRPC entry/tx stream).
+///
+/// Fail-closed gate: when `admitted == false` (signature unverified OR leader
+/// unknown) this is a NO-OP and returns `false` — `observed_tip` is NOT advanced,
+/// `repair_map`/coverage is NOT seeded, and the caller must NOT push/emit. This is
+/// what keeps forged and unknown-leader shreds off the money path and prevents
+/// them from poisoning the tip or coverage accounting.
+fn gate_socket_shred(
+    admitted:     bool,
+    info:         &ShredInfo,
+    observed_tip: &AtomicU64,
+    repair_map:   &Mutex<HashMap<u64, SlotRepairState>>,
+) -> bool {
+    if !admitted {
+        return false;
+    }
+    observed_tip.fetch_max(info.slot, Ordering::Relaxed);
+    if info.is_data {
+        if let Ok(mut map) = repair_map.try_lock() {
+            let state = map.entry(info.slot).or_insert_with(SlotRepairState::new);
+            state.have.insert(info.index);
+            if info.last_in_slot {
+                state.last_index = Some(info.index);
+            }
+        }
+    }
+    true
+}
+
 struct SlotRepairState {
     have:            HashSet<u32>,
     last_index:      Option<u32>,
@@ -488,6 +519,59 @@ mod shred_flag_tests {
     }
 }
 
+
+// ─── unit tests for the fail-closed ingest gate (gate_socket_shred) ──────────
+
+#[cfg(test)]
+mod ingest_gate_tests {
+    use super::*;
+
+    fn data_shred(slot: u64, index: u32, last: bool) -> ShredInfo {
+        ShredInfo { slot, index, is_data: true, last_in_slot: last }
+    }
+
+    #[test]
+    fn unverified_shred_is_dropped_and_does_not_advance_tip_or_coverage() {
+        // Mirrors an unknown-leader / forged shred: admit() returned false.
+        let tip = AtomicU64::new(100);
+        let map: Mutex<HashMap<u64, SlotRepairState>> = Mutex::new(HashMap::new());
+        let info = data_shred(5_000, 7, true);
+
+        let emit = gate_socket_shred(false, &info, &tip, &map);
+
+        // Not emitted (caller pushes to deshredder/entry stream only if `emit`).
+        assert!(!emit, "unverified shred must NOT be pushed to the entry stream");
+        // Tip did not advance from the forged shred.
+        assert_eq!(tip.load(Ordering::Relaxed), 100, "forged shred must not move observed_tip");
+        // Coverage (repair_map) untouched → cannot mark the slot complete.
+        assert!(map.lock().unwrap().is_empty(), "forged shred must not seed coverage");
+    }
+
+    #[test]
+    fn verified_shred_advances_tip_and_seeds_coverage_and_emits() {
+        let tip = AtomicU64::new(100);
+        let map: Mutex<HashMap<u64, SlotRepairState>> = Mutex::new(HashMap::new());
+        let info = data_shred(5_000, 7, true);
+
+        let emit = gate_socket_shred(true, &info, &tip, &map);
+
+        assert!(emit, "verified shred is pushed to the entry stream");
+        assert_eq!(tip.load(Ordering::Relaxed), 5_000, "verified shred advances observed_tip");
+        let guard = map.lock().unwrap();
+        let state = guard.get(&5_000).expect("slot seeded in repair_map");
+        assert!(state.have.contains(&7));
+        assert_eq!(state.last_index, Some(7));
+    }
+
+    #[test]
+    fn verified_but_older_shred_does_not_regress_tip() {
+        let tip = AtomicU64::new(9_000);
+        let map: Mutex<HashMap<u64, SlotRepairState>> = Mutex::new(HashMap::new());
+        let info = data_shred(5_000, 0, false);
+        gate_socket_shred(true, &info, &tip, &map);
+        assert_eq!(tip.load(Ordering::Relaxed), 9_000, "fetch_max never regresses the tip");
+    }
+}
 
 /// Load a Solana keypair JSON file, or generate a fresh one and save it so
 /// gossip identity survives restarts. Format is the standard Solana JSON array
@@ -721,15 +805,18 @@ fn main() -> Result<()> {
 
     // ── shred sigverify: leader schedule + counters ──────────────────────────
     // Leader-keyed shred signature verification (agave verify_shred_cpu). The
-    // schedule covers the current epoch; the TVU thread verifies every shred
-    // against its slot leader before feeding the deshredder. See sigverify.rs
-    // for the fail-closed (known leader) vs admit-and-count (unknown leader,
-    // deep-probe stub boundary) policy.
+    // cache holds per-epoch schedules (fetched on demand, keyed by epoch); the
+    // TVU thread verifies every shred against its slot leader before feeding the
+    // deshredder. Policy is fail-closed for BOTH branches (agave-faithful):
+    //   * leader known  → verify; DROP on signature failure.
+    //   * leader unknown → DROP; record the epoch for background on-demand fetch.
+    // The money path (deshredder → gRPC entry+tx stream) never emits an
+    // unverified shred; observed_tip and coverage never advance from one.
     let leader_sched: Arc<Mutex<sigverify::LeaderScheduleCache>> =
-        Arc::new(Mutex::new(sigverify::LeaderScheduleCache::new(cfg.rpc_url.clone())));
-    let sv_verified:   Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-    let sv_rejected:   Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-    let sv_no_leader:  Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+        Arc::new(Mutex::new(sigverify::LeaderScheduleCache::new()));
+    let sv_verified:          Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let sv_rejected:          Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let sv_dropped_no_leader: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     // ── measurement harness shared state ─────────────────────────────────────
     let observed_tip: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -810,29 +897,101 @@ fn main() -> Result<()> {
         eprintln!("[colibri] TLS:            disabled (plain gRPC)");
     }
 
-    // Leader-schedule refresh thread: initial fetch + re-fetch on epoch rollover.
+    // Leader-schedule background thread: bootstrap epoch math + current epoch,
+    // then service on-demand per-epoch fetch requests. ALL blocking RPCs happen
+    // OUTSIDE the cache lock (fetch → then install under a brief lock) so the
+    // per-shred ingest lookup never blocks on a network round-trip.
+    //
+    // Fail-closed startup: the money path drops every shred until epoch math AND
+    // the current-epoch schedule are loaded (leader_for_slot → None until then).
+    // Epoch rollover: a tip shred whose (new) epoch is not loaded is dropped and
+    // its epoch is queued in `pending`; this loop drains `pending` every ~500ms,
+    // so the blind window at a boundary is sub-second, not the old 30s.
     {
-        let sched_refresh = leader_sched.clone();
-        let tip_refresh   = observed_tip.clone();
-        let exit_sched    = exit.clone();
+        let sched_bg   = leader_sched.clone();
+        let rpc_url_bg = cfg.rpc_url.clone();
+        let exit_bg    = exit.clone();
         std::thread::spawn(move || {
-            // Block for the first observed shred so getEpochInfo aligns with the
-            // slot we actually see, then fetch. (getEpochInfo works without it too;
-            // this just avoids a fetch before we know we are live.)
+            // Force the current-epoch preload on the first iteration.
+            let mut last_current_check = Instant::now() - Duration::from_secs(3600);
             loop {
-                if exit_sched.load(Ordering::Relaxed) { return; }
-                let tip = tip_refresh.load(Ordering::Relaxed);
-                let did = sched_refresh.lock().unwrap_or_else(|e| e.into_inner())
-                    .refresh_if_stale(tip);
-                if did {
-                    let (a, b) = sched_refresh.lock().unwrap_or_else(|e| e.into_inner()).loaded_range();
-                    eprintln!("[sigverify] active schedule covers slots [{a}, {b})");
+                if exit_bg.load(Ordering::Relaxed) { return; }
+
+                // ── (1) bootstrap epoch math (getEpochSchedule), once ────────
+                let math = sched_bg.lock().unwrap_or_else(|e| e.into_inner()).math();
+                let math = match math {
+                    Some(m) => m,
+                    None => match sigverify::fetch_epoch_math(&rpc_url_bg) {
+                        Some(m) => {
+                            sched_bg.lock().unwrap_or_else(|e| e.into_inner()).install_math(m);
+                            eprintln!("[sigverify] epoch math loaded: {m:?}");
+                            m
+                        }
+                        None => {
+                            eprintln!("[sigverify] getEpochSchedule failed; retrying in 1s");
+                            for _ in 0..5 {
+                                if exit_bg.load(Ordering::Relaxed) { return; }
+                                sleep(Duration::from_millis(200));
+                            }
+                            continue;
+                        }
+                    },
+                };
+
+                // ── (2) ensure current epoch loaded (startup + rollover heal) ─
+                if last_current_check.elapsed() >= Duration::from_secs(10) {
+                    last_current_check = Instant::now();
+                    if let Some(abs) = sigverify::fetch_absolute_slot(&rpc_url_bg) {
+                        if let Some(cur_epoch) = math.epoch_of(abs) {
+                            let need = !sched_bg.lock().unwrap_or_else(|e| e.into_inner())
+                                .has_epoch(cur_epoch);
+                            if need {
+                                if let Some((fs, es, leaders)) =
+                                    sigverify::fetch_epoch_leaders(&rpc_url_bg, cur_epoch, &math)
+                                {
+                                    let mut g = sched_bg.lock().unwrap_or_else(|e| e.into_inner());
+                                    g.install_epoch(cur_epoch, fs, es, leaders);
+                                    let (a, b) = g.loaded_range();
+                                    drop(g);
+                                    eprintln!(
+                                        "[sigverify] current epoch {cur_epoch} loaded; \
+                                         active schedule covers slots [{a}, {b})"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
-                // Poll every 30s: cheap when in-epoch (refresh_if_stale is a no-op),
-                // re-fetches promptly on epoch rollover.
-                for _ in 0..30 {
-                    if exit_sched.load(Ordering::Relaxed) { return; }
-                    sleep(Duration::from_secs(1));
+
+                // ── (3) service on-demand pending epochs (fetch OUTSIDE lock) ─
+                let pending = sched_bg.lock().unwrap_or_else(|e| e.into_inner()).take_pending();
+                for epoch in pending {
+                    if exit_bg.load(Ordering::Relaxed) { return; }
+                    if sched_bg.lock().unwrap_or_else(|e| e.into_inner()).has_epoch(epoch) {
+                        continue; // already loaded via another path
+                    }
+                    match sigverify::fetch_epoch_leaders(&rpc_url_bg, epoch, &math) {
+                        Some((fs, es, leaders)) => {
+                            let mut g = sched_bg.lock().unwrap_or_else(|e| e.into_inner());
+                            g.install_epoch(epoch, fs, es, leaders);
+                            drop(g);
+                            eprintln!("[sigverify] on-demand epoch {epoch} loaded [{fs}, {es})");
+                        }
+                        None => {
+                            // RPC has no schedule for this epoch (deep historical):
+                            // stay fail-closed — its shreds keep being dropped. A
+                            // fresh ingest miss re-queues it if it becomes relevant.
+                            eprintln!(
+                                "[sigverify] on-demand epoch {epoch} unavailable — \
+                                 shreds for it stay DROPPED (fail-closed)"
+                            );
+                        }
+                    }
+                }
+
+                for _ in 0..5 {
+                    if exit_bg.load(Ordering::Relaxed) { return; }
+                    sleep(Duration::from_millis(100));
                 }
             }
         });
@@ -843,7 +1002,7 @@ fn main() -> Result<()> {
     let leader_sched_tvu   = leader_sched.clone();
     let sv_verified_tvu    = sv_verified.clone();
     let sv_rejected_tvu    = sv_rejected.clone();
-    let sv_no_leader_tvu   = sv_no_leader.clone();
+    let sv_dropped_tvu     = sv_dropped_no_leader.clone();
     let entry_tx_tvu       = entry_tx.clone();
     let tx_tx_tvu          = tx_tx.clone();
     let observed_tip_tvu   = observed_tip.clone();
@@ -861,12 +1020,16 @@ fn main() -> Result<()> {
 
         eprintln!("[tvu] ready — inline deshredding, no UDP forward");
 
-        // Leader-keyed shred sigverify gate (agave verify_shred_cpu). Returns
-        // true if the shred may be ingested:
+        // Leader-keyed shred sigverify gate (agave verify_shred_cpu). Fail-closed
+        // for BOTH branches — returns true ONLY for a signature-verified shred:
         //   * leader known  → verify signature over the Merkle root; DROP on
-        //                      failure (fail-closed, == agave).
-        //   * leader unknown → ADMIT but count `sv_no_leader` (stub boundary for
-        //                      slots outside the loaded current epoch; see sigverify.rs).
+        //                      failure (== agave).
+        //   * leader unknown → DROP and count `sv_dropped_no_leader`. The lookup
+        //                      also records the missing epoch so the background
+        //                      thread fetches its schedule on demand; until then
+        //                      the money path emits nothing for that epoch.
+        // A false return means: not emitted to the gRPC stream, observed_tip not
+        // advanced, repair_map/coverage not touched.
         let admit = |bytes: &[u8], slot: u64| -> bool {
             let leader = leader_sched_tvu.lock().unwrap_or_else(|e| e.into_inner())
                 .leader_for_slot(slot);
@@ -881,8 +1044,8 @@ fn main() -> Result<()> {
                     }
                 }
                 None => {
-                    sv_no_leader_tvu.fetch_add(1, Ordering::Relaxed);
-                    true
+                    sv_dropped_tvu.fetch_add(1, Ordering::Relaxed);
+                    false
                 }
             }
         };
@@ -897,11 +1060,27 @@ fn main() -> Result<()> {
 
             while let Ok(bytes) = repair_shred_rx.try_recv() {
                 // Verify repaired shreds against the slot leader before ingest.
-                let slot = match parse_shred_header(&bytes) {
-                    Some(info) => info.slot,
+                // Fail-closed: an unverified repair response is dropped — it is
+                // NOT emitted AND does NOT advance coverage (`repair_map.have`),
+                // so a forged repair response cannot mark a slot complete.
+                let info = match parse_shred_header(&bytes) {
+                    Some(info) => info,
                     None => continue,
                 };
-                if !admit(&bytes, slot) { continue; }
+                if !admit(&bytes, info.slot) { continue; }
+                // Coverage accounting for VERIFIED repaired shreds only. (The
+                // repair thread no longer counts unverified responses.) Kept as
+                // get_mut so we only credit slots we are actually tracking.
+                if info.is_data {
+                    if let Ok(mut map) = repair_map_tvu.try_lock() {
+                        if let Some(state) = map.get_mut(&info.slot) {
+                            state.have.insert(info.index);
+                            if info.last_in_slot {
+                                state.last_index = Some(info.index);
+                            }
+                        }
+                    }
+                }
                 if let Some(se) = deshredder.push_raw(&bytes) {
                     if se.complete {
                         completed_set_tvu.lock().unwrap_or_else(|e| e.into_inner()).insert(se.slot);
@@ -938,24 +1117,12 @@ fn main() -> Result<()> {
 
                     // Sigverify BEFORE any state update: a forged shred must not
                     // move observed_tip, seed repair_map, or reach the deshredder.
+                    // gate_socket_shred applies side effects ONLY when admitted
+                    // (verified); an unverified shred is a no-op → not pushed below.
                     let verified = match parse_shred_header(&buf[..n]) {
                         Some(info) => {
-                            if admit(&buf[..n], info.slot) {
-                                observed_tip_tvu.fetch_max(info.slot, Ordering::Relaxed);
-                                if info.is_data {
-                                    if let Ok(mut map) = repair_map_tvu.try_lock() {
-                                        let state = map.entry(info.slot)
-                                            .or_insert_with(SlotRepairState::new);
-                                        state.have.insert(info.index);
-                                        if info.last_in_slot {
-                                            state.last_index = Some(info.index);
-                                        }
-                                    }
-                                }
-                                true
-                            } else {
-                                false
-                            }
+                            let ok = admit(&buf[..n], info.slot);
+                            gate_socket_shred(ok, &info, &observed_tip_tvu, &repair_map_tvu)
                         }
                         None => false,
                     };
@@ -993,11 +1160,11 @@ fn main() -> Result<()> {
                         let tip = observed_tip_tvu.load(Ordering::Relaxed);
                         let sv_ok  = sv_verified_tvu.load(Ordering::Relaxed);
                         let sv_bad = sv_rejected_tvu.load(Ordering::Relaxed);
-                        let sv_unk = sv_no_leader_tvu.load(Ordering::Relaxed);
+                        let sv_unk = sv_dropped_tvu.load(Ordering::Relaxed);
                         eprintln!(
                             "[tvu] shreds={total} published={published} tip={tip} \
                              assembler_slots={} dedup_slots={} \
-                             sigverify[ok={sv_ok} rejected={sv_bad} no_leader={sv_unk}]",
+                             sigverify[ok={sv_ok} rejected={sv_bad} dropped_no_leader={sv_unk}]",
                             deshredder.active_slot_count(),
                             deshredder.tracked_slot_count(),
                         );
@@ -1066,20 +1233,12 @@ fn main() -> Result<()> {
                                 }
                                 repair_wire::Inbound::ShredResponse => {
                                     arc_resp_rep.fetch_add(1, Ordering::Relaxed);
-                                    // Feed repaired shred back into repair_map so
-                                    // is_full() counts it (closes completeness undercount).
-                                    if let Some(info) = parse_shred_header(&recv_buf[..n]) {
-                                        if info.is_data {
-                                            if let Ok(mut map) = repair_map_rep.try_lock() {
-                                                if let Some(state) = map.get_mut(&info.slot) {
-                                                    state.have.insert(info.index);
-                                                    if info.last_in_slot {
-                                                        state.last_index = Some(info.index);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
+                                    // Forward to the TVU thread, which sigverifies
+                                    // the response and — only if it verifies —
+                                    // credits repair_map.have and emits it. Coverage
+                                    // accounting is intentionally NOT done here: a
+                                    // forged/unverified repair response must not be
+                                    // able to mark a slot complete (fail-closed).
                                     let _ = repair_shred_tx.send(recv_buf[..n].to_vec());
                                 }
                                 repair_wire::Inbound::Other => { /* discard */ }
@@ -1586,10 +1745,10 @@ fn main() -> Result<()> {
         eprintln!("  pongs_sent:     {pongs_sent}  pong_errors={pong_errors}");
         eprintln!("  responses:      {responses}");
         eprintln!(
-            "  sigverify:      ok={} rejected={} no_leader={}",
+            "  sigverify:      ok={} rejected={} dropped_no_leader={}",
             sv_verified.load(Ordering::Relaxed),
             sv_rejected.load(Ordering::Relaxed),
-            sv_no_leader.load(Ordering::Relaxed),
+            sv_dropped_no_leader.load(Ordering::Relaxed),
         );
         eprintln!("  uptime:         {}s", start.elapsed().as_secs());
         if let Ok(sampler_guard) = oracle_sampler.lock() {
