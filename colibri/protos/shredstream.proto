@@ -4,12 +4,22 @@ package shredstream;
 message Entry {
     uint64 slot    = 1;
     bytes  entries = 2;
+    // True only on the emission that finished the slot (the LAST_SHRED_IN_SLOT
+    // entry batch). Entry batches are streamed in-order as they complete; the
+    // assembler blocks on any gap, so a `complete = true` message guarantees
+    // every prior batch of this slot was already emitted. A subscriber that
+    // never sees `complete = true` for a slot (the slot was dropped on an
+    // unfillable gap) holds only a prefix and MUST NOT replay it as a full slot.
+    bool complete = 3;
 }
 
 message Transaction {
     uint64 slot       = 1;
     string signature  = 2;
     bytes  raw_tx     = 3;
+    // Set on transactions emitted by the batch that finished the slot. See
+    // Entry.complete — this is the same slot-completeness signal per-tx.
+    bool   complete   = 4;
 }
 
 message SubscribeEntriesRequest {}

@@ -1,6 +1,5 @@
 # Workspace contains only the colibri binary.
-# The deshredder library lives at /Users/newuser/RustroverProjects/Deshreder/
-# as a standalone open-source crate.
+# The deshredder library is a standalone open-source crate published to crates.io.
 [workspace]
 members  = ["colibri"]
 resolver = "2"
@@ -12,6 +11,9 @@ bincode = "1"
 tokio   = { version = "1", features = ["full"] }
 anyhow  = "1"
 
+# LTO disabled: rustc 1.95 emits LLVM 22 bitcode that Apple's ld/libLTO (LLVM 21)
+# cannot parse during thin-LTO link. LTO buys nothing for this measurement spike.
 [profile.release]
-lto           = "thin"
+lto           = "off"
 codegen-units = 1
+
