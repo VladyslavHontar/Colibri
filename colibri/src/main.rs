@@ -1091,6 +1091,11 @@ fn main() -> Result<()> {
                         entries:  se.entries_bytes,
                         complete: se.complete,
                     });
+                    // Per-tx base58 + bincode is the most expensive work in this
+                    // thread; skip it entirely when nothing consumes it (no
+                    // SubscribeTransactions subscriber and oracle off). Entry
+                    // subscribers are served by the entry_tx send above.
+                    if oracle_enabled_tvu || tx_tx_tvu.receiver_count() > 0 {
                     for entry in &se.entries {
                         for tx in &entry.transactions {
                             let sig = tx.signatures.first()
@@ -1106,6 +1111,7 @@ fn main() -> Result<()> {
                                 });
                             }
                         }
+                    }
                     }
                     published += 1;
                 }
@@ -1137,6 +1143,9 @@ fn main() -> Result<()> {
                             entries:  se.entries_bytes,
                             complete: se.complete,
                         });
+                        // Same skip as the repair path above: no tx subscriber
+                        // and no oracle → don't pay base58+bincode per tx.
+                        if oracle_enabled_tvu || tx_tx_tvu.receiver_count() > 0 {
                         for entry in &se.entries {
                             for tx in &entry.transactions {
                                 let sig = tx.signatures.first()
@@ -1152,6 +1161,7 @@ fn main() -> Result<()> {
                                     });
                                 }
                             }
+                        }
                         }
                         published += 1;
                     } }
