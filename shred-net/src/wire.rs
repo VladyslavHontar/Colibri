@@ -1,6 +1,12 @@
 //! Repair-socket wire codec: classify inbound packets, build Pong replies,
 //! and encode outbound repair requests.
 //!
+//! Ported verbatim from Colibri's Phase-0-proven `repair_wire.rs` (the modern
+//! signed repair variants + ping-pong responder that unlocked the repair
+//! firehose — 478/478 pongs, 1.26M responses). Legacy tag-3 requests are
+//! silently rejected by agave's `Unsigned` arm; only these modern variants
+//! (disc 8/9/10) plus the ping-pong gate get served.
+//!
 //! # Wire layout (authoritative: docs/repair-wire-format.md)
 //!
 //! Inbound `RepairResponse::Ping` (132 bytes):
@@ -26,11 +32,6 @@
 //!
 //! Signed bytes (agave canonical, all modern request types):
 //!   sign_data = buf[0..4] ++ buf[68..]   (discriminant ‖ everything after sig)
-//!
-//! SHA-256 path: manual implementation using `sha2` crate.
-//! (`solana_gossip::ping_pong::Pong::new` is available but requires constructing
-//! a `Ping<32>` object, while `RepairResponse` is in `solana-core` which is not
-//! a dependency. The manual sha2 path is simpler and equally correct.)
 
 use {
     sha2::{Digest, Sha256},
@@ -70,7 +71,7 @@ pub enum Inbound {
     /// Inbound `RepairResponse::Ping` — carries the 32-byte token that must be
     /// echoed back (hashed) in the Pong reply.
     Ping([u8; 32]),
-    /// Inbound shred data — forward to the deshredder channel.
+    /// Inbound shred data — forward to the reconstruction sink.
     ShredResponse,
     /// Anything else — discard silently.
     Other,
@@ -81,7 +82,7 @@ pub enum Inbound {
 /// Classification rules (from docs/repair-wire-format.md):
 /// 1. `len == 132 && buf[0..4] == [0,0,0,0]`  → `Ping(token@[36..68])`
 /// 2. `len >= 88` and shred-variant byte at `buf[64]` matches a known shred
-///    variant (same logic as `parse_shred_header` in `main.rs`)  → `ShredResponse`
+///    variant  → `ShredResponse`
 /// 3. everything else  → `Other`
 pub fn parse_inbound(buf: &[u8]) -> Inbound {
     // Rule 1: Ping — classify by size (132) first, then 4-byte LE discriminant == 0.
@@ -267,7 +268,6 @@ mod tests {
 
     #[test]
     fn pong_has_expected_length_and_token_echo() {
-        // Layout asserted here MUST match docs/repair-wire-format.md (Task 0).
         let kp = Keypair::new();
         let token = [7u8; 32];
         let pong = build_pong(&kp, token);
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn parse_inbound_classifies_ping_vs_shred() {
-        // A synthesised Ping per Task 0 layout → Inbound::Ping(token)
+        // A synthesised Ping → Inbound::Ping(token)
         let ping_bytes = synth_ping([9u8; 32]);
         match parse_inbound(&ping_bytes) {
             Inbound::Ping(t) => assert_eq!(t, [9u8; 32]),
@@ -287,7 +287,7 @@ mod tests {
         }
         // A data-shred-shaped buffer (variant byte at [64]) → ShredResponse
         let mut shred = vec![0u8; 200];
-        shred[64] = 0x80; // data shred variant, per parse_shred_header at main.rs:249
+        shred[64] = 0x80; // data shred variant
         assert!(matches!(parse_inbound(&shred), Inbound::ShredResponse));
     }
 
@@ -315,7 +315,6 @@ mod tests {
 
     #[test]
     fn window_index_modern_layout() {
-        // Guards the move from main.rs and the modernization to discriminant 8.
         let kp = Keypair::new();
         let req = window_index(&kp, &[3u8; 32], 100, 5, 0xCC);
         assert_eq!(req.len(), WINDOW_INDEX_WIRE_LEN);
@@ -341,9 +340,7 @@ mod tests {
         assert_eq!(&req[0..4], &9u32.to_le_bytes());
         assert_eq!(&req[SENDER_OFF..SENDER_OFF + 32], kp.pubkey().as_ref());
         assert_eq!(&req[RECIPIENT_OFF..RECIPIENT_OFF + 32], &rcpt);
-        // slot at [144..152]
         assert_eq!(&req[144..152], &100u64.to_le_bytes());
-        // shred_index at [152..160]
         assert_eq!(&req[152..160], &5u64.to_le_bytes());
     }
 
@@ -358,17 +355,13 @@ mod tests {
         assert_eq!(&req[0..4], &10u32.to_le_bytes());
         assert_eq!(&req[SENDER_OFF..SENDER_OFF + 32], kp.pubkey().as_ref());
         assert_eq!(&req[RECIPIENT_OFF..RECIPIENT_OFF + 32], &rcpt);
-        // slot at [144..152]
         assert_eq!(&req[144..152], &100u64.to_le_bytes());
     }
 
     #[test]
     fn window_index_sign_data_is_96_bytes_excl_sig() {
-        // Verify the sign_data construction: discriminant(4) ++ buf[68..] = 4 + 92 = 96 bytes
-        // for window_index (total 160 bytes; 160 - 68 = 92 bytes after sig region).
         let kp = Keypair::new();
         let req = window_index(&kp, &[0u8; 32], 1, 0, 0);
-        // sign_data length = 4 + (160 - 68) = 96
         assert_eq!(req.len(), 160);
         // The signature at [4..68] must not be all-zero (it was filled by sign_message)
         assert_ne!(&req[4..68], &[0u8; 64][..]);
@@ -376,7 +369,6 @@ mod tests {
 
     #[test]
     fn orphan_sign_data_is_88_bytes_excl_sig() {
-        // sign_data length = 4 + (152 - 68) = 88 bytes for Orphan.
         let kp = Keypair::new();
         let req = orphan(&kp, &[0u8; 32], 1, 0);
         assert_eq!(req.len(), 152);

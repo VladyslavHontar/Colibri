@@ -8,26 +8,23 @@ name = "colibri"
 path = "src/main.rs"
 
 [dependencies]
-# Deshredder — now a standalone library at the sibling repo.
+# Deshredder — the standalone shred→entries assembly library (fast lane).
 deshredder = { git = "https://github.com/VladyslavHontar/Deshreder.git" }
+
+# The P2P complete lane: gossip join + repair protocol + Blockstore
+# reconstruction (workspace member).
+shred-net = { path = "../shred-net" }
 
 # solana-ledger: reused ONLY for faithful shred sigverify (shred::layout merkle-root
 # extraction). agave-unstable-api exposes the `shred` module — same feature and
 # agave tag (v3.1.5) as deshredder, so no extra rocksdb build / native lib conflict.
 solana-ledger = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5", features = ["agave-unstable-api"] }
 
-# Gossip stack — agave v3.1.5, same tag as deshredder's solana-ledger.
-# Both share one rocksdb build (0.23) — no native library conflict.
-# GossipService::new takes Arc<[UdpSocket]> in agave (vs UdpSocket in jito fork).
-solana-gossip     = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
-solana-net-utils  = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
-solana-streamer   = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
 # Pin leaf crates to the exact agave v3.1.5 workspace versions.
+# (The gossip/repair/reconstruction stack lives in the shred-net crate.)
 solana-keypair    = "=3.0.1"
 solana-signer     = "=3.0.0"
-solana-hash       = "=3.1.0"
 solana-pubkey     = "=3.0.0"
-solana-time-utils = "=3.0.0"
 solana-signature  = { version = "=3.1.0", default-features = false }
 
 # gRPC
@@ -40,10 +37,7 @@ anyhow     = { workspace = true }
 bincode    = { workspace = true }
 serde_json = "1"
 subtle     = "2"
-sha2       = "0.10"
-socket2    = "0.5"
 env_logger = "0.11"
-log        = "0.4"
 
 [build-dependencies]
 tonic-build = "0.12"
