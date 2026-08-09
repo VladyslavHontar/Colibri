@@ -9,15 +9,16 @@ WORKDIR /build
 # Build context is the parent directory (/Users/newuser/RustroverProjects/)
 # which contains both Colibri/ and Deshreder/ repos.
 
-# Copy the Deshreder library (deshredder path dep)
+# Copy the Deshreder library (deshredder dep, built from the local checkout)
 COPY Deshreder ./Deshreder
 
 # Copy workspace files from Colibri/
 COPY Colibri/Cargo.toml Colibri/Cargo.lock ./
 COPY Colibri/colibri ./colibri
+COPY Colibri/shred-net ./shred-net
 
-# Rewrite path dep to point at the local copy inside the build context
-RUN sed -i 's|path = "../../../../../../Deshreder"|path = "../Deshreder"|' colibri/Cargo.toml
+# Build deshredder from the local copy instead of fetching the git dep
+RUN sed -i 's|deshredder = { git = ".*" }|deshredder = { path = "../Deshreder" }|' colibri/Cargo.toml
 
 RUN cargo build --release -p colibri --jobs 4
 

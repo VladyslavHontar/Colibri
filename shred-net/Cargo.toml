@@ -1,0 +1,46 @@
+[package]
+name        = "shred-net"
+version     = "0.1.0"
+edition     = "2024"
+description = "Solana P2P shred network: gossip join + ping-gate + repair + Blockstore reconstruction. Colibri's 'complete lane'."
+license     = "MIT"
+
+[lib]
+name = "shred_net"
+path = "src/lib.rs"
+
+[dependencies]
+# Wire codec (ping/pong + repair request encoders). Pinned to the exact agave
+# v3.1.5 workspace leaf versions — same pins as the sibling `deshredder` crate
+# so the whole workspace resolves one consistent tree (no five8 dep break).
+solana-keypair    = "=3.0.1"
+solana-signer     = "=3.0.0"
+solana-time-utils = "=3.0.0"
+solana-signature  = { version = "=3.1.0", default-features = false }
+sha2              = "0.10"
+
+# Reconstruction: the ephemeral, repair-driven agave Blockstore (FEC sets,
+# completed-data-indexes, is_full, find_missing_data_indexes, get_slot_entries).
+# agave-unstable-api exposes the shred module (matches the deshredder pin).
+solana-ledger = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5", features = ["agave-unstable-api"] }
+solana-entry  = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
+anyhow        = "1"
+tempfile      = "3"
+
+# Gossip stack (same agave v3.1.5 tag as Colibri's proven Phase-0 setup).
+solana-gossip    = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
+solana-net-utils = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
+solana-streamer  = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5" }
+solana-pubkey    = "=3.0.0"
+solana-hash      = "=3.1.0"
+log              = "0.4"
+socket2          = "0.5"
+
+[dev-dependencies]
+# Logging for the `coverage` example harness (examples may use dev-deps).
+env_logger = "0.11"
+# Generate real merkle shreds in reconstruction tests via
+# `Shredder::entries_to_merkle_shreds_for_tests` (reachable through the normal
+# solana-ledger `agave-unstable-api` dep — no `dev-context-only-utils`, which
+# drags in solana-runtime's gated HashOverrides and fails to compile).
+solana-hash = "=3.1.0"

@@ -13,7 +13,6 @@ use std::{
 struct SlotRec {
     targeted_at:   Instant,
     completed_at:  Option<Instant>,
-    last_index:    Option<u32>,
 }
 
 // ── public API ───────────────────────────────────────────────────────────────
@@ -45,7 +44,6 @@ impl CoverageMeter {
         self.slots.entry(slot).or_insert_with(|| SlotRec {
             targeted_at:  at,
             completed_at: None,
-            last_index:   None,
         });
     }
 
@@ -61,14 +59,6 @@ impl CoverageMeter {
             if rec.completed_at.is_none() {
                 rec.completed_at = Some(at);
             }
-        }
-    }
-
-    /// Record the highest shred index seen for `slot` (informational; stored
-    /// but not yet used by `report()`).
-    pub fn mark_last_index(&mut self, slot: u64, last: u32) {
-        if let Some(rec) = self.slots.get_mut(&slot) {
-            rec.last_index = Some(last);
         }
     }
 

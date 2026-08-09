@@ -1,7 +1,9 @@
-# Workspace contains only the colibri binary.
-# The deshredder library is a standalone open-source crate published to crates.io.
+# colibri — the node binary (gossip + TVU ingest + sigverify + repair + gRPC).
+# shred-net — the P2P complete lane (gossip join, repair protocol, Blockstore
+#             reconstruction) embedded by colibri.
+# The deshredder assembly library is the standalone open-source Deshreder repo.
 [workspace]
-members  = ["colibri"]
+members  = ["colibri", "shred-net"]
 resolver = "2"
 
 [workspace.dependencies]
