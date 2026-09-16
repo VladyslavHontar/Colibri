@@ -1679,14 +1679,13 @@ dependencies = [
 [[package]]
 name = "deshredder"
 version = "0.1.0"
-source = "git+https://github.com/VladyslavHontar/Deshreder.git#ea9a6f6e43270c7b062d18816277ec289c2ee2f7"
+source = "git+https://github.com/VladyslavHontar/Deshreder.git#b92938b404a1fd2ba46b1a432a3886fbf783fa94"
 dependencies = [
  "bincode",
  "solana-entry",
  "solana-keypair",
  "solana-ledger",
  "solana-signature",
- "tonic-build 0.12.3",
 ]
 
 [[package]]
