@@ -61,6 +61,10 @@ fn print_usage() {
     eprintln!("  --port <PORT>           Gossip UDP port (default: 8000)");
     eprintln!("  --tvu-port <PORT>       TVU port where shreds arrive (default: 8200)");
     eprintln!("  --repair-port <PORT>    UDP port for repair responses (default: 8210)");
+    eprintln!("  --stun <HOST:PORT>      STUN server; advertise each socket's real");
+    eprintln!("                          external NAT mapping instead of --ip:port.");
+    eprintln!("                          Needed behind a port-rewriting NAT; omit");
+    eprintln!("                          on a host with a real public IP.");
     eprintln!("  --entrypoint <ADDR>     Solana entrypoint (repeatable — pass several)");
     eprintln!("  --shred-version <VER>   Shred version (default: fetched from entrypoint)");
     eprintln!("  --rpc <URL>             RPC endpoint for stake + leader-schedule data");
@@ -82,6 +86,7 @@ struct Config {
     port:          u16,
     tvu_port:      u16,
     repair_port:   u16,
+    stun_server:   Option<String>,
     entrypoints:   Vec<String>,
     shred_version: Option<u16>,
     rpc_url:       String,
@@ -103,6 +108,7 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
     let mut port: u16 = 8000;
     let mut tvu_port: u16 = 8200;
     let mut repair_port: u16 = 8210;
+    let mut stun_server: Option<String> = None;
     let mut entrypoints: Vec<String> = Vec::new();
     let mut shred_version: Option<u16> = None;
     let mut rpc_url = "http://api.mainnet-beta.solana.com".to_string();
@@ -124,6 +130,7 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
             "--port"          => { i += 1; port          = args[i].parse()?; }
             "--tvu-port"      => { i += 1; tvu_port      = args[i].parse()?; }
             "--repair-port"   => { i += 1; repair_port   = args[i].parse()?; }
+            "--stun"          => { i += 1; stun_server   = Some(args[i].clone()); }
             "--entrypoint"    => { i += 1; entrypoints.push(args[i].clone()); }
             "--shred-version" => { i += 1; shred_version = Some(args[i].parse()?); }
             "--rpc"           => { i += 1; rpc_url       = args[i].clone(); }
@@ -149,7 +156,7 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
 
     let ip = ip.ok_or("--ip <PUBLIC_IP> is required")?;
     Ok(Config {
-        ip, port, tvu_port, repair_port, entrypoints, shred_version,
+        ip, port, tvu_port, repair_port, stun_server, entrypoints, shred_version,
         rpc_url, tier1_fanout, grpc_port, auth_token, tls_cert, tls_key,
         keypair_path, depth, window, top_peers, oracle_rpc,
     })
@@ -687,6 +694,7 @@ fn main() -> Result<()> {
             gossip_port:   cfg.port,
             tvu_port:      cfg.tvu_port,
             repair_port:   cfg.repair_port,
+            stun_server:   cfg.stun_server.clone(),
             shred_version: cfg.shred_version,
             entrypoints:   cfg.entrypoints.clone(),
             // Retain enough Blockstore history that a slow-completing backlog

@@ -24,6 +24,7 @@
 pub mod gossip;
 pub mod reconstruct;
 pub mod repair;
+pub mod stun;
 pub mod runner;
 pub mod wire;
 
