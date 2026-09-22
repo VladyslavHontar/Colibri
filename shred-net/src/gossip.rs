@@ -17,9 +17,8 @@ use {
     },
     solana_hash::Hash,
     solana_keypair::Keypair,
-    solana_net_utils::bind_in_range,
+    solana_net_utils::{bind_in_range, SocketAddrSpace},
     solana_signer::Signer,
-    solana_streamer::socket::SocketAddrSpace,
     solana_time_utils::timestamp,
     std::{
         collections::HashMap,
@@ -111,13 +110,16 @@ pub fn join(
         );
     }
 
+    // agave 4.3.0 added an `xdp_sender` parameter between the sockets and the
+    // validator allow-list. `None` keeps the ordinary UDP send path.
     let gossip_service = GossipService::new(
         &cluster_info,
-        None,
+        /*epoch_specs=*/ None,
         Arc::from([gossip_socket]),
-        None,
-        true,
-        None,
+        /*xdp_sender=*/ None,
+        /*gossip_validators=*/ None,
+        /*should_check_duplicate_instance=*/ true,
+        /*stats_reporter_sender=*/ None,
         exit,
     );
 

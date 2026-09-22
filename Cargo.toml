@@ -7,8 +7,8 @@ members  = ["colibri", "shred-net"]
 resolver = "2"
 
 [workspace.dependencies]
-# Deshredder now uses agave v3.1.5 (agave-unstable-api feature exposes the shred module).
-# Colibri gossip also uses agave v3.1.5 → single rocksdb 0.23, no native lib conflict.
+# Deshredder now uses agave v4.3.0 (agave-unstable-api feature exposes the shred module).
+# Colibri gossip also uses agave v4.3.0 → one rocksdb build (anza fork, see [patch.crates-io]), no native lib conflict.
 bincode = "1"
 tokio   = { version = "1", features = ["full"] }
 anyhow  = "1"
@@ -19,3 +19,11 @@ anyhow  = "1"
 lto           = "off"
 codegen-units = 1
 
+# agave v4.3.0 does not build against the crates.io rocksdb: its blockstore_db
+# calls `new_pinnable_slice` / `get_pinned_cf_into` / `DBPinnableSlice::reset`,
+# which exist only in anza's fork. Agave declares the fork as a normal workspace
+# dependency; because we consume agave as a git dependency we have to repeat the
+# override here, at the exact rev agave's Cargo.lock resolves.
+[patch.crates-io]
+librocksdb-sys = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
+rocksdb = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }

@@ -55,9 +55,14 @@ impl Reconstructor {
         };
         // No-recovery insert path (broadcast-stage equivalent). Completeness is
         // achieved by repair-until-full, not FEC.
+        let Ok(mut batch) = self.blockstore.get_write_batch() else {
+            return false;
+        };
+        let mut slice = self.blockstore.new_pinnable_slice();
         self.blockstore
-            .insert_cow_shreds([Cow::Owned(shred)], None, /*is_trusted=*/ false)
+            .insert_cow_shreds([Cow::Owned(shred)], /*is_trusted=*/ false, &mut slice, &mut batch)
             .is_ok()
+            && self.blockstore.write_batch(batch).is_ok()
     }
 
     /// Insert many raw shred packets in ONE `insert_cow_shreds` call. Parses
@@ -71,7 +76,17 @@ impl Reconstructor {
             .map(Cow::Owned)
             .collect();
         let n = shreds.len();
-        let _ = self.blockstore.insert_cow_shreds(shreds, None, /*is_trusted=*/ false);
+        let Ok(mut batch) = self.blockstore.get_write_batch() else {
+            return 0;
+        };
+        let mut slice = self.blockstore.new_pinnable_slice();
+        if self
+            .blockstore
+            .insert_cow_shreds(shreds, /*is_trusted=*/ false, &mut slice, &mut batch)
+            .is_ok()
+        {
+            let _ = self.blockstore.write_batch(batch);
+        }
         n
     }
 
@@ -105,11 +120,11 @@ impl Reconstructor {
             None => return Vec::new(),
         };
         // Scan to last_index+1 when known, else to the highest index seen so far.
-        // first_timestamp/defer = 0 disables the recency grace period so every
-        // genuine gap is reported immediately (we drive repair ourselves).
+        // agave 4.3.0 dropped the `first_timestamp`/`defer_threshold_ticks`
+        // recency grace period from this call, which is what we wanted anyway:
+        // every genuine gap is reported immediately because we drive repair.
         let end = meta.last_index.map(|l| l + 1).unwrap_or(meta.received);
-        self.blockstore
-            .find_missing_data_indexes(slot, 0, 0, 0, end, max)
+        self.blockstore.find_missing_data_indexes(slot, 0, end, max)
     }
 
     /// If `slot` is full, extract its entries and purge it from the store.
