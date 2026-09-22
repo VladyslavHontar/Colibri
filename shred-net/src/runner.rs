@@ -75,6 +75,11 @@ pub struct ShredNetConfig {
     pub repair_port:  u16,
     pub shred_version: Option<u16>,
     pub entrypoints:  Vec<String>,
+    /// STUN server (`host:port`) for running behind a port-rewriting NAT.
+    /// `Some` ⇒ advertise each socket's discovered external mapping instead of
+    /// `advertise_ip` plus the bound port, and keep the TVU mapping alive.
+    /// `None` on a host with a real public IP. See [`crate::stun`].
+    pub stun_server: Option<String>,
     /// Purge slots below `tip - keep_window` to bound the ephemeral store.
     pub keep_window:  u64,
     /// How many slots to repair in parallel. Throughput is response-bound, so a
@@ -95,6 +100,7 @@ impl Default for ShredNetConfig {
             repair_port: 8210,
             shred_version: None,
             entrypoints: Vec::new(),
+            stun_server: None,
             keep_window: 8_000,
             target_window: 64,
             top_peers: 64,
@@ -165,11 +171,33 @@ impl ShredNet {
         sink: Arc<dyn BlockSink>,
     ) -> anyhow::Result<Self> {
         let exit = Arc::new(AtomicBool::new(false));
+        let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+        // Bind TVU before joining gossip: behind a NAT the port we bind is not
+        // the port turbine must be sent to, and ContactInfo has to carry the
+        // mapping that actually exists.
+        let tvu_socket = UdpSocket::bind(SocketAddr::new(bind_ip, cfg.tvu_port))?;
+        tvu_socket.set_read_timeout(Some(Duration::from_millis(10)))?;
+        set_recv_buffer(&tvu_socket, 32 * 1024 * 1024);
+        let tvu_advertise = match &cfg.stun_server {
+            Some(server) => {
+                let mapped = crate::stun::external_addr(&tvu_socket, server)?;
+                log::info!(
+                    "[shred-net] tvu: bound :{}, advertising {mapped}",
+                    cfg.tvu_port
+                );
+                mapped
+            }
+            None => SocketAddr::new(cfg.advertise_ip, cfg.tvu_port),
+        };
+        let tvu_socket = Arc::new(tvu_socket);
+
         let node = gossip::join(
             &GossipConfig {
                 advertise_ip: cfg.advertise_ip,
                 gossip_port: cfg.gossip_port,
-                tvu_port: cfg.tvu_port,
+                tvu_advertise,
+                stun_server: cfg.stun_server.clone(),
                 shred_version: cfg.shred_version,
                 entrypoints: cfg.entrypoints.clone(),
             },
@@ -189,21 +217,29 @@ impl ShredNet {
         // Repair socket is shared: the recv thread reads it (and sends pongs);
         // the dispatch thread sends requests. UDP send from multiple threads is
         // fine; only the recv thread calls recv_from.
-        let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         let repair_sock = UdpSocket::bind(SocketAddr::new(bind_ip, cfg.repair_port))?;
         repair_sock.set_read_timeout(Some(Duration::from_millis(5)))?;
         set_recv_buffer(&repair_sock, 32 * 1024 * 1024);
         let repair_sock = Arc::new(repair_sock);
 
         let mut handles = Vec::new();
+        // TVU only ever receives, so nothing refreshes its NAT mapping; without
+        // a keepalive the turbine feed stops when the router expires it.
+        if let Some(server) = cfg.stun_server.clone() {
+            handles.push(crate::stun::spawn_keepalive(
+                tvu_socket.clone(),
+                server,
+                exit.clone(),
+            ));
+        }
         handles.push(spawn_tvu(
-            cfg.tvu_port,
+            tvu_socket,
             exit.clone(),
             insert_tx.clone(),
             sink.clone(),
             observed_tip.clone(),
             diag.clone(),
-        )?);
+        ));
         handles.push(spawn_repair_recv(
             repair_sock.clone(),
             exit.clone(),
@@ -295,20 +331,17 @@ fn submit(tx: &SyncSender<Vec<u8>>, bytes: &[u8], diag: &Diag) -> bool {
     }
 }
 
+/// Drain turbine. The socket is bound and configured by the caller so its NAT
+/// mapping can be discovered before gossip advertises it.
 fn spawn_tvu(
-    tvu_port: u16,
+    tvu_socket: Arc<UdpSocket>,
     exit: Arc<AtomicBool>,
     insert_tx: SyncSender<Vec<u8>>,
     sink: Arc<dyn BlockSink>,
     observed_tip: Arc<AtomicU64>,
     diag: Arc<Diag>,
-) -> anyhow::Result<JoinHandle<()>> {
-    let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-    let tvu_socket = UdpSocket::bind(SocketAddr::new(bind_ip, tvu_port))?;
-    tvu_socket.set_read_timeout(Some(Duration::from_millis(10)))?;
-    set_recv_buffer(&tvu_socket, 32 * 1024 * 1024);
-
-    Ok(std::thread::spawn(move || {
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
         let mut buf = [0u8; 1280];
         loop {
             if exit.load(Ordering::Relaxed) {
@@ -334,7 +367,7 @@ fn spawn_tvu(
                 Err(e) => log::warn!("[shred-net][tvu] recv error: {e}"),
             }
         }
-    }))
+    })
 }
 
 /// Drains the repair socket continuously — pong replies inline (cheap), shred

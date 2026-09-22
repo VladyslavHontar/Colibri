@@ -33,8 +33,14 @@ pub struct GossipConfig {
     pub advertise_ip: IpAddr,
     /// Gossip UDP port to advertise/bind.
     pub gossip_port: u16,
-    /// TVU UDP port to advertise (shreds arrive here).
-    pub tvu_port: u16,
+    /// Address to advertise for TVU (shreds arrive here). Behind a NAT this is
+    /// the STUN-discovered mapping of the bound TVU socket, not `advertise_ip`
+    /// plus the bound port — see [`crate::stun`].
+    pub tvu_advertise: SocketAddr,
+    /// STUN server (`host:port`). `Some` ⇒ discover the gossip socket's real
+    /// external mapping and advertise that instead of `advertise_ip:bound_port`.
+    /// Leave `None` on a host with a real public IP.
+    pub stun_server: Option<String>,
     /// Shred version. `None` → fetch from the first reachable entrypoint.
     pub shred_version: Option<u16>,
     /// Cluster entrypoints. Pass several — one dead entrypoint stalls gossip.
@@ -59,8 +65,27 @@ pub fn join(
     // Bind on 0.0.0.0, advertise the public IP (canonical agave pattern).
     let bind_ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
     let (gport, gossip_socket) = bind_in_range(bind_ip, (cfg.gossip_port, cfg.gossip_port + 1))?;
-    let gossip_addr = SocketAddr::new(cfg.advertise_ip, gport);
-    let tvu_addr = SocketAddr::new(cfg.advertise_ip, cfg.tvu_port);
+
+    // A NAT that rewrites source ports makes `advertise_ip:gport` a lie, and a
+    // node that advertises an unmapped port receives nothing. Ask from the
+    // gossip socket itself what the mapping actually is.
+    let gossip_addr = match &cfg.stun_server {
+        Some(server) => {
+            let mapped = crate::stun::external_addr(&gossip_socket, server)?;
+            if mapped.ip() != cfg.advertise_ip {
+                log::warn!(
+                    "[shred-net] STUN reports {} but --ip says {}; advertising the \
+                     STUN address",
+                    mapped.ip(),
+                    cfg.advertise_ip
+                );
+            }
+            log::info!("[shred-net] gossip: bound :{gport}, advertising {mapped}");
+            mapped
+        }
+        None => SocketAddr::new(cfg.advertise_ip, gport),
+    };
+    let tvu_addr = cfg.tvu_advertise;
 
     // Resolve shred version (config override, else probe the first entrypoint).
     let shred_version = cfg.shred_version.or_else(|| {

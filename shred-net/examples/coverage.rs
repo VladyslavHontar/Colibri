@@ -56,6 +56,7 @@ struct Args {
     repair_port:  u16,
     entrypoints:  Vec<String>,
     keypair_path: Option<String>,
+    stun_server:  Option<String>,
     probe_depth:  u64,
     top_peers:    usize,
     window:       usize,
@@ -68,6 +69,7 @@ fn parse_args() -> Result<Args, String> {
     let mut repair_port = 8210u16;
     let mut entrypoints = Vec::new();
     let mut keypair_path = None;
+    let mut stun_server: Option<String> = None;
     let mut probe_depth = 6000u64;
     let mut top_peers = 64usize;
     let mut window = 64usize;
@@ -82,6 +84,7 @@ fn parse_args() -> Result<Args, String> {
             "--repair-port" => { i += 1; repair_port = argv[i].parse().map_err(|e| format!("--repair-port: {e}"))?; }
             "--entrypoint"  => { i += 1; entrypoints.push(argv[i].clone()); }
             "--keypair"     => { i += 1; keypair_path = Some(argv[i].clone()); }
+            "--stun"        => { i += 1; stun_server = Some(argv[i].clone()); }
             "--probe-depth" => { i += 1; probe_depth = argv[i].parse().map_err(|e| format!("--probe-depth: {e}"))?; }
             "--top-peers"   => { i += 1; top_peers = argv[i].parse().map_err(|e| format!("--top-peers: {e}"))?; }
             "--window"      => { i += 1; window = argv[i].parse().map_err(|e| format!("--window: {e}"))?; }
@@ -91,9 +94,14 @@ fn parse_args() -> Result<Args, String> {
     }
 
     Ok(Args {
-        ip: ip.ok_or("--ip <PUBLIC_IP> is required")?,
-        gossip_port, tvu_port, repair_port, entrypoints, keypair_path, probe_depth,
-        top_peers, window,
+        ip: match (ip, &stun_server) {
+            (Some(ip), _) => ip,
+            // STUN discovers the advertised address, so --ip is unused.
+            (None, Some(_)) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            (None, None) => return Err("--ip <PUBLIC_IP> is required (or pass --stun)".into()),
+        },
+        gossip_port, tvu_port, repair_port, entrypoints, keypair_path, stun_server,
+        probe_depth, top_peers, window,
     })
 }
 
@@ -124,6 +132,7 @@ fn main() -> anyhow::Result<()> {
             repair_port:  args.repair_port,
             shred_version: None,
             entrypoints:  args.entrypoints,
+            stun_server:  args.stun_server,
             keep_window:  args.probe_depth + 2000,
             target_window: args.window,
             top_peers:    args.top_peers,
