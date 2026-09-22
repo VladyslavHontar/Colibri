@@ -434,7 +434,7 @@ impl BlockSink for ColibriSink {
             return;
         }
 
-        if let Ok(bytes) = bincode::serialize(&entries) {
+        if let Ok(bytes) = wincode::serialize(&entries) {
             let _ = self.entry_tx.send(ProtoEntry { slot, entries: bytes, complete: true });
         }
         self.emit_txs(slot, &entries, true);
@@ -452,7 +452,7 @@ impl BlockSink for ColibriSink {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&slot);
-        if let Ok(bytes) = bincode::serialize(&Vec::<Entry>::new()) {
+        if let Ok(bytes) = wincode::serialize(&Vec::<Entry>::new()) {
             let _ = self.entry_tx.send(ProtoEntry { slot, entries: bytes, complete: true });
         }
     }

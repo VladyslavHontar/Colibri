@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Deshredder — the standalone shred→entries assembly library (fast lane).
-deshredder = { git = "https://github.com/VladyslavHontar/Deshreder.git" }
+deshredder = { git = "https://github.com/VladyslavHontar/Deshreder.git", rev = "3821af05102d6f5fa4e1b26481c48397522ae428" }
 
 # The P2P complete lane: gossip join + repair protocol + Blockstore
 # reconstruction (workspace member).
@@ -17,19 +17,22 @@ shred-net = { path = "../shred-net" }
 
 # solana-ledger: reused ONLY for faithful shred sigverify (shred::layout merkle-root
 # extraction). agave-unstable-api exposes the `shred` module — same feature and
-# agave tag (v3.1.5) as deshredder, so no extra rocksdb build / native lib conflict.
-solana-ledger = { git = "https://github.com/anza-xyz/agave.git", tag = "v3.1.5", features = ["agave-unstable-api"] }
+# agave tag (v4.3.0) as deshredder, so no extra rocksdb build / native lib conflict.
+solana-ledger = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0", features = ["agave-unstable-api"] }
 
-# Pin leaf crates to the exact agave v3.1.5 workspace versions.
+# Pin leaf crates to the exact agave v4.3.0 workspace versions.
 # (The gossip/repair/reconstruction stack lives in the shred-net crate.)
-solana-keypair    = "=3.0.1"
-solana-signer     = "=3.0.0"
-solana-pubkey     = "=3.0.0"
-solana-signature  = { version = "=3.1.0", default-features = false }
+solana-keypair    = "=3.1.2"
+solana-signer     = "=3.0.1"
+solana-pubkey     = "=4.3.0"
+solana-signature  = { version = "=3.5.2", default-features = false }
 
 # gRPC
 tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
+# agave 4.3.0 serialises `Entry` with wincode, not serde. Byte-compatible with
+# bincode, so the emitted gRPC payload is unchanged for subscribers.
+wincode = "0.6.1"
 
 # Async + utils
 tokio      = { workspace = true }
