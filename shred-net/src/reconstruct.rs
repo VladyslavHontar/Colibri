@@ -1,169 +1,102 @@
-//! Ephemeral, repair-driven block reconstruction over agave's `Blockstore`.
+//! Repair-driven block reconstruction over the deshredder.
 //!
-//! This is the "complete lane": raw shreds (turbine + repair) are parsed and
-//! inserted into a throwaway `Blockstore`, which tracks per-slot
-//! completed-data-sets and `is_full()`. The repair driver asks
-//! [`Reconstructor::missing_indices`] which shreds are still missing and fetches
-//! them until [`Reconstructor::is_full`]; then [`Reconstructor::take_complete`]
-//! yields the slot's entries and purges it.
-//!
-//! No FEC/erasure recovery on insert (we use the no-recovery `insert_cow_shreds`
-//! path). Completeness is achieved purely by repair-until-full — re-requesting
-//! the actual missing data shreds, which Phase 0 proved peers serve at firehose
-//! scale. FEC recovery is a future bandwidth optimization, not a correctness
-//! requirement.
+//! This is the "complete lane": every raw shred (turbine + repair) is pushed
+//! into one [`Deshredder`], which rebuilds lost data shreds from coding
+//! shreds (Reed–Solomon) and emits each entry batch the moment it is
+//! contiguous. The repair driver asks [`Reconstructor::missing_indices`]
+//! which data shreds are still absent and fetches them until
+//! [`Reconstructor::is_full`]; nothing is stored on disk and nothing is read
+//! back — the entries leave through the events `insert_batch` returns.
 
 use {
-    solana_entry::entry::Entry,
-    solana_ledger::{
-        blockstore::{blockstore_purge::PurgeType, Blockstore},
-        shred::Shred,
-    },
-    std::borrow::Cow,
-    tempfile::TempDir,
+    deshredder::{Deshredder, Event},
+    std::sync::Mutex,
 };
 
-/// Owns an ephemeral `Blockstore` in a temp dir (deleted on drop).
+/// One assembler shared by the insert worker and the repair driver.
+/// ponytail: a single mutex; insert and dispatch each hold it for microseconds.
 pub struct Reconstructor {
-    blockstore: Blockstore,
-    /// Low-water mark for [`Reconstructor::purge_below`]: slots `< low_water`
-    /// have already been purged (so the janitor never rescans them).
-    low_water: std::sync::atomic::AtomicU64,
-    // Held only to keep the temp dir alive for the Blockstore's lifetime.
-    _dir: TempDir,
+    asm: Mutex<Deshredder>,
+}
+
+impl Default for Reconstructor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Reconstructor {
-    /// Open a fresh ephemeral blockstore in a new temp directory.
-    pub fn new() -> anyhow::Result<Self> {
-        let dir = tempfile::tempdir()?;
-        let blockstore = Blockstore::open(dir.path())?;
-        Ok(Self {
-            blockstore,
-            low_water: std::sync::atomic::AtomicU64::new(0),
-            _dir: dir,
-        })
+    pub fn new() -> Self {
+        Self { asm: Mutex::new(Deshredder::new()) }
     }
 
-    /// Insert one raw shred packet (from turbine or the repair socket).
-    /// Parses to a `Shred` and inserts without FEC recovery. Non-shred or
-    /// unparseable bytes are ignored. Returns `true` if a shred was inserted.
-    pub fn insert_packet(&self, raw: &[u8]) -> bool {
-        let shred = match Shred::new_from_serialized_shred(raw.to_vec()) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        // No-recovery insert path (broadcast-stage equivalent). Completeness is
-        // achieved by repair-until-full, not FEC.
-        let Ok(mut batch) = self.blockstore.get_write_batch() else {
-            return false;
-        };
-        let mut slice = self.blockstore.new_pinnable_slice();
-        self.blockstore
-            .insert_cow_shreds([Cow::Owned(shred)], /*is_trusted=*/ false, &mut slice, &mut batch)
-            .is_ok()
-            && self.blockstore.write_batch(batch).is_ok()
+    fn lock(&self) -> std::sync::MutexGuard<'_, Deshredder> {
+        self.asm.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Insert many raw shred packets in ONE `insert_cow_shreds` call. Parses
-    /// each (dropping unparseable bytes) and inserts the lot together, so the
-    /// rocksdb lock + write-batch commit is amortized across the whole batch
-    /// instead of paid per shred. Returns the number of shreds submitted.
-    pub fn insert_batch(&self, raws: &[Vec<u8>]) -> usize {
-        let shreds: Vec<Cow<Shred>> = raws
-            .iter()
-            .filter_map(|b| Shred::new_from_serialized_shred(b.clone()).ok())
-            .map(Cow::Owned)
-            .collect();
-        let n = shreds.len();
-        let Ok(mut batch) = self.blockstore.get_write_batch() else {
-            return 0;
-        };
-        let mut slice = self.blockstore.new_pinnable_slice();
-        if self
-            .blockstore
-            .insert_cow_shreds(shreds, /*is_trusted=*/ false, &mut slice, &mut batch)
-            .is_ok()
-        {
-            let _ = self.blockstore.write_batch(batch);
+    /// Push many raw packets under one lock; events (entry batches, footers,
+    /// slot completions) are appended to `out`. Returns the packet count.
+    pub fn insert_batch(&self, raws: &[Vec<u8>], out: &mut Vec<Event>) -> usize {
+        let mut asm = self.lock();
+        for raw in raws {
+            asm.push(raw, out);
         }
-        n
+        raws.len()
     }
 
-    /// Is `slot` fully reconstructed (all data shreds `0..=last_index` present)?
+    /// Is `slot` fully reconstructed (every batch through LAST_IN_SLOT emitted)?
     pub fn is_full(&self, slot: u64) -> bool {
-        self.blockstore
-            .meta(slot)
-            .ok()
-            .flatten()
-            .is_some_and(|m| m.is_full())
+        self.lock().is_complete(slot)
     }
 
     /// The slot's final shred index, if a `LAST_IN_SLOT` shred has arrived.
     /// `None` means we still need a `HighestWindowIndex` probe to learn it.
     pub fn last_index(&self, slot: u64) -> Option<u64> {
-        self.blockstore.meta(slot).ok().flatten().and_then(|m| m.last_index)
+        self.lock().last_index(slot).map(u64::from)
     }
 
-    /// The slot this block was built on, once any shred has arrived. Slots
-    /// strictly between `parent_slot(slot)` and `slot` were never produced
-    /// (skipped) — this drives skip detection in the repair driver.
+    /// The slot this block was built on, once any data shred has arrived.
+    /// Slots strictly between `parent_slot(slot)` and `slot` were never
+    /// produced (skipped) — this drives skip detection in the repair driver.
     pub fn parent_slot(&self, slot: u64) -> Option<u64> {
-        self.blockstore.meta(slot).ok().flatten().and_then(|m| m.parent_slot)
+        self.lock().parent_slot(slot)
     }
 
     /// Up to `max` missing data-shred indices for `slot` — the set that drives
     /// `WindowIndex` repair requests. Empty when the slot is full or untouched.
     pub fn missing_indices(&self, slot: u64, max: usize) -> Vec<u64> {
-        let meta = match self.blockstore.meta(slot).ok().flatten() {
-            Some(m) => m,
-            None => return Vec::new(),
-        };
-        // Scan to last_index+1 when known, else to the highest index seen so far.
-        // agave 4.3.0 dropped the `first_timestamp`/`defer_threshold_ticks`
-        // recency grace period from this call, which is what we wanted anyway:
-        // every genuine gap is reported immediately because we drive repair.
-        let end = meta.last_index.map(|l| l + 1).unwrap_or(meta.received);
-        self.blockstore.find_missing_data_indexes(slot, 0, end, max)
+        self.lock().missing(slot, max).into_iter().map(u64::from).collect()
     }
 
-    /// If `slot` is full, extract its entries and purge it from the store.
-    /// Returns `None` if the slot is not yet complete.
-    pub fn take_complete(&self, slot: u64) -> Option<Vec<Entry>> {
-        if !self.is_full(slot) {
-            return None;
-        }
-        let entries = self.blockstore.get_slot_entries(slot, 0).ok()?;
-        // Drop the slot so the ephemeral store stays bounded.
-        let _ = self.blockstore.purge_slots(slot, slot, PurgeType::Exact);
-        Some(entries)
-    }
-
-    /// Purge every slot below `keep_from` to bound the ephemeral store (turbine
-    /// inserts all near-tip shreds, including slots we never targeted). Tracks a
-    /// low-water mark so each slot range is purged at most once.
+    /// Forget every slot below `keep_from` (bounds memory; the assembler has
+    /// no clock of its own).
     pub fn purge_below(&self, keep_from: u64) {
-        use std::sync::atomic::Ordering;
-        let from = self.low_water.load(Ordering::Relaxed);
-        if keep_from > from {
-            let _ = self
-                .blockstore
-                .purge_slots(from, keep_from - 1, PurgeType::CompactionFilter);
-            self.low_water.store(keep_from, Ordering::Relaxed);
-        }
+        self.lock().evict_below(keep_from);
+    }
+
+    /// Highest data index seen for `slot` (diagnostics).
+    pub fn received(&self, slot: u64) -> Option<u64> {
+        self.lock().received(slot).map(u64::from)
+    }
+
+    /// Slots currently being assembled.
+    pub fn active_slots(&self) -> usize {
+        self.lock().active_slots()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deshredder::Entry;
     use solana_hash::Hash;
     use solana_keypair::Keypair;
-    use solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, Shredder};
+    use solana_ledger::shred::{ProcessShredsStats, ReedSolomonCache, Shred, Shredder};
 
     /// Build a real multi-data-shred slot (one shredding call → contiguous data
     /// indices, last shred carries LAST_IN_SLOT). Many empty entries guarantee
-    /// several data shreds so we can model a mid-slot gap.
+    /// several data shreds so we can model a mid-slot gap. Coding shreds are
+    /// dropped so the gap cannot be erasure-recovered.
     fn make_multishred_slot(slot: u64) -> (Vec<Shred>, Vec<Entry>) {
         let parent = slot.saturating_sub(1);
         let keypair = Keypair::new();
@@ -184,46 +117,54 @@ mod tests {
         (data, entries)
     }
 
-    fn raw(shred: &Shred) -> &[u8] {
-        &shred.payload().bytes
+    fn raw(shred: &Shred) -> Vec<u8> {
+        shred.payload().bytes.to_vec()
     }
 
-    /// A whole slot inserted in ONE batched call completes and extracts cleanly
-    /// (the throughput path: amortize rocksdb lock/commit over many shreds).
-    #[test]
-    fn batch_insert_completes_slot_and_extracts_entries() {
-        let (shreds, entries) = make_multishred_slot(101);
-        let raws: Vec<Vec<u8>> = shreds.iter().map(|s| raw(s).to_vec()).collect();
+    fn entries_of(events: &[Event]) -> Vec<Entry> {
+        events.iter().filter_map(|e| match e {
+            Event::Entries { entries, .. } => Some(entries.clone()),
+            _ => None,
+        }).flatten().collect()
+    }
 
-        let r = Reconstructor::new().unwrap();
-        let n = r.insert_batch(&raws);
-        assert_eq!(n, shreds.len(), "all shreds parsed+submitted in one call");
+    /// A whole slot inserted in ONE batched call completes and its events
+    /// carry exactly the original entries, ending in SlotComplete.
+    #[test]
+    fn batch_insert_completes_slot_and_emits_entries() {
+        let (shreds, entries) = make_multishred_slot(101);
+        let raws: Vec<Vec<u8>> = shreds.iter().map(raw).collect();
+
+        let r = Reconstructor::new();
+        let mut events = Vec::new();
+        assert_eq!(r.insert_batch(&raws, &mut events), shreds.len());
 
         assert!(r.is_full(101));
-        assert_eq!(r.take_complete(101).unwrap(), entries);
+        assert_eq!(entries_of(&events), entries);
+        assert!(matches!(events.last(), Some(Event::SlotComplete { slot: 101 })));
     }
 
     /// `parent_slot` reports the slot this block was built on — the basis for
-    /// skip detection (slots strictly between a block and its parent were never
-    /// produced).
+    /// skip detection — and still answers after the slot completed.
     #[test]
     fn parent_slot_reports_the_chained_parent() {
-        // make_multishred_slot(N) shreds with parent = N-1.
         let (shreds, _entries) = make_multishred_slot(207);
-        let r = Reconstructor::new().unwrap();
-        for s in &shreds {
-            r.insert_packet(raw(s));
-        }
+        let r = Reconstructor::new();
+        r.insert_batch(&[raw(&shreds[0])], &mut Vec::new());
         assert_eq!(r.parent_slot(207), Some(206));
-        // Untouched slot has no meta → None.
+        r.insert_batch(&shreds[1..].iter().map(raw).collect::<Vec<_>>(), &mut Vec::new());
+        assert!(r.is_full(207));
+        assert_eq!(r.parent_slot(207), Some(206), "known after completion, until purge");
         assert_eq!(r.parent_slot(999), None);
+        r.purge_below(208);
+        assert_eq!(r.parent_slot(207), None);
     }
 
     /// The core complete-lane flow: a slot with a mid-slot gap is incomplete and
     /// reports the missing index; once that shred is repaired the slot becomes
-    /// full and yields exactly the original entries, then is purged.
+    /// full and the events add up to exactly the original entries.
     #[test]
-    fn gap_then_repair_completes_slot_and_extracts_entries() {
+    fn gap_then_repair_completes_slot_and_emits_entries() {
         let (shreds, entries) = make_multishred_slot(100);
         assert!(shreds.len() >= 3, "need a multi-shred slot to model a gap (got {})", shreds.len());
 
@@ -232,33 +173,26 @@ mod tests {
         let withheld_index = shreds[withhold].index() as u64;
         let last_index = (shreds.len() - 1) as u64;
 
-        let r = Reconstructor::new().unwrap();
-        for (i, s) in shreds.iter().enumerate() {
-            if i == withhold {
-                continue;
-            }
-            assert!(r.insert_packet(raw(s)));
-        }
+        let r = Reconstructor::new();
+        let mut events = Vec::new();
+        let raws: Vec<Vec<u8>> = shreds.iter().enumerate()
+            .filter(|(i, _)| *i != withhold).map(|(_, s)| raw(s)).collect();
+        r.insert_batch(&raws, &mut events);
 
-        // Last shred present → last_index known; but a gap remains → not full.
         assert_eq!(r.last_index(100), Some(last_index));
         assert!(!r.is_full(100), "slot must be incomplete with a gap");
         assert!(
             r.missing_indices(100, 16).contains(&withheld_index),
             "the withheld index must be reported as missing (drives repair)"
         );
-        assert!(r.take_complete(100).is_none(), "incomplete slot yields nothing");
+        assert!(!matches!(events.last(), Some(Event::SlotComplete { .. })));
 
         // "Repair" delivers the missing shred.
-        assert!(r.insert_packet(raw(&shreds[withhold])));
+        r.insert_batch(&[raw(&shreds[withhold])], &mut events);
 
         assert!(r.is_full(100), "slot is complete once the gap is filled");
         assert!(r.missing_indices(100, 16).is_empty());
-
-        let got = r.take_complete(100).expect("full slot yields its entries");
-        assert_eq!(got, entries, "reconstructed entries must match the original");
-
-        // After extraction the slot is purged.
-        assert!(r.take_complete(100).is_none());
+        assert_eq!(entries_of(&events), entries, "reconstructed entries must match the original");
+        assert!(matches!(events.last(), Some(Event::SlotComplete { slot: 100 })));
     }
 }

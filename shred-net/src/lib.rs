@@ -14,12 +14,12 @@
 //!   - `gossip`        — (next) join gossip, advertise ContactInfo, score peers.
 //!   - `repair`        — (next) the repair driver: decide & dispatch
 //!                       Window/HighestWindow/Orphan requests per slot.
-//!   - `reconstruct`   — (next) agave `Blockstore`-backed slot reconstruction:
-//!                       FEC + completed-data-sets + repair-until-`is_full`.
+//!   - `reconstruct`   — deshredder-backed slot reconstruction: FEC recovery
+//!                       + entry batches as they complete + repair-until-full.
 //!
 //! The public surface is a `ShredNet` that, given a config + a peer source,
-//! drives repair until each targeted slot reaches `is_full()` and emits the
-//! complete block. Colibri wraps it as its complete lane.
+//! drives repair until each targeted slot is complete, streaming entry batches
+//! (turbine and repair alike) to the sink as they assemble.
 
 pub mod gossip;
 pub mod reconstruct;

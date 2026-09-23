@@ -48,7 +48,6 @@
 //!     coverage NEVER completes from one. There is no admit-on-unknown branch.
 
 use {
-    solana_ledger::shred::layout,
     solana_pubkey::Pubkey,
     solana_signature::Signature,
     std::{
@@ -76,13 +75,14 @@ pub fn verify_shred_signature(shred: &[u8], leader: &Pubkey) -> bool {
     };
     let sig = Signature::from(<[u8; 64]>::try_from(sig_bytes).unwrap());
 
-    // Merkle root is the signed message. `get_merkle_root` walks the proof embedded
-    // in the shred payload; `None` for legacy/malformed shreds.
-    let Some(root) = layout::get_merkle_root(shred) else {
+    // Merkle root is the signed message. The deshredder walks the proof
+    // embedded in the shred payload (checked against agave's
+    // `layout::get_merkle_root`); `None` for legacy/malformed shreds.
+    let Some(root) = deshredder::merkle_root(shred) else {
         return false;
     };
 
-    sig.verify(leader.as_ref(), root.as_ref())
+    sig.verify(leader.as_ref(), &root)
 }
 
 /// Epoch↔slot arithmetic, mirroring agave's `EpochSchedule` in the post-warmup

@@ -2,21 +2,18 @@
 //! TVU (Turbine), repairs missing slots over the repair protocol, and streams
 //! entries/transactions to subscribers via a Jito-compatible gRPC service.
 //!
-//! Two lanes over one ingest (both fed by `shred-net`'s sockets through
-//! `BlockSink::on_raw_shred`):
+//! One assembler, two feeds: every leader-sigverified shred — turbine or
+//! repair — goes into `shred-net`'s in-memory `deshredder` (Reed–Solomon FEC
+//! recovery), and entry batches stream out the moment they are contiguous,
+//! `complete = true` on the batch that finishes the slot. `shred-net` drives
+//! repair until every targeted slot is complete and reports empty-entry skip
+//! markers for slots that were never produced; the targeted range follows the
+//! consumer's `from-slot` frontier (gRPC metadata), falling back to
+//! `tip - depth`.
 //!
-//!   - FAST lane — every leader-sigverified shred goes straight into the
-//!     in-memory `deshredder`; entry batches stream out with minimal latency,
-//!     `complete = true` on the batch that finishes the slot.
-//!   - COMPLETE lane — `shred-net` drives repair until every targeted slot is
-//!     `is_full()` in an ephemeral Blockstore, emitting whole blocks for slots
-//!     the fast lane missed and empty-entry skip markers for slots that were
-//!     never produced. The targeted range follows the consumer's `from-slot`
-//!     frontier (gRPC metadata), falling back to `tip - depth`.
-//!
-//! Sigverify is fail-closed on BOTH lanes: `on_raw_shred` returning `false`
-//! means the shred is not emitted, not inserted into the Blockstore, and does
-//! not advance the observed tip.
+//! Sigverify is fail-closed: `on_raw_shred` returning `false` means the shred
+//! is not emitted, never reaches the assembler, and does not advance the
+//! observed tip.
 
 #![allow(deprecated)]
 
@@ -27,7 +24,7 @@ mod sigverify;
 
 use {
     anyhow::Result,
-    deshredder::{Deshredder, Entry, Event},
+    deshredder::{Entry, Event},
     serde_json::Value,
     server::{ProtoEntry, ProtoFooter, ProtoTransaction},
     shred_net::{BlockSink, ShredNet, ShredNetConfig},
@@ -342,24 +339,25 @@ mod shred_slot_tests {
     }
 }
 
-// ─── the sink: sigverify gate + fast lane + complete lane ───────────────────
+// ─── the sink: sigverify gate + gRPC fan-out of assembler events ─────────────
 
-/// Mutable fast-lane state, locked once per admitted near-tip shred.
-struct FastLane {
-    deshredder: Deshredder,
-    /// Reused across pushes so the quiet path allocates nothing.
-    events:     Vec<Event>,
+/// Stream counters, locked once per assembler event batch.
+struct Stats {
     last_log:   Instant,
-    total:      u64,
+    /// Shreds admitted by sigverify (turbine + repair).
+    admitted:   u64,
     published:  u64,
     /// Block footers seen — tells whether Alpenglow markers are live upstream.
     footers:    u64,
 }
 
-/// Colibri's `BlockSink`: leader-keyed sigverify gate (fail-closed), inline
-/// deshredder fast lane, and complete-lane block/skip emission.
+/// Colibri's `BlockSink`: leader-keyed sigverify gate (fail-closed) and the
+/// gRPC fan-out of everything the assembler emits. One assembler serves both
+/// turbine and repair, so a batch streams the moment it is contiguous and the
+/// slot's last batch carries `complete = true`; skipped slots get an empty
+/// marker.
 struct ColibriSink {
-    fast:          Mutex<FastLane>,
+    stats:         Mutex<Stats>,
     leader_sched:  Arc<Mutex<sigverify::LeaderScheduleCache>>,
     sv_verified:   AtomicU64,
     sv_rejected:   AtomicU64,
@@ -369,11 +367,10 @@ struct ColibriSink {
     footer_tx:     Arc<broadcast::Sender<ProtoFooter>>,
     meter:         Arc<Mutex<coverage::CoverageMeter>>,
     oracle:        Arc<Mutex<Option<oracle::OracleSampler>>>,
-    /// Slots the fast lane finished — the complete lane skips re-emitting them
-    /// (a subscriber already holds every entry batch of the slot).
-    fast_complete: Mutex<HashSet<u64>>,
-    /// Highest verified slot seen; used to keep deep-backfill repair shreds out
-    /// of the fast lane (they belong to the complete lane only).
+    /// Signatures per in-flight slot, kept only while the RPC oracle is on
+    /// (it cross-checks a completed slot's full signature set).
+    slot_sigs:     Mutex<HashMap<u64, HashSet<String>>>,
+    /// Highest verified slot seen (diagnostics).
     tip:           AtomicU64,
 }
 
@@ -414,14 +411,13 @@ impl ColibriSink {
 }
 
 impl BlockSink for ColibriSink {
-    /// Sigverify gate + fast lane. Fail-closed for BOTH branches
-    /// (agave-faithful):
+    /// Sigverify gate. Fail-closed for BOTH branches (agave-faithful):
     ///   * leader known  → verify signature over the Merkle root; DROP on
     ///                     failure.
     ///   * leader unknown → DROP; the lookup records the epoch so the
     ///                     background thread fetches its schedule on demand.
-    /// Returning `false` keeps the shred out of the gRPC stream, out of the
-    /// Blockstore, and keeps it from advancing the observed tip.
+    /// Returning `false` keeps the shred out of the assembler (hence the gRPC
+    /// stream) and keeps it from advancing the observed tip.
     fn on_raw_shred(&self, bytes: &[u8]) -> bool {
         let Some(slot) = shred_slot(bytes) else { return false };
 
@@ -444,126 +440,90 @@ impl BlockSink for ColibriSink {
             }
         }
 
-        let tip = self.tip.fetch_max(slot, Ordering::Relaxed).max(slot);
-
-        // Fast lane only near the tip: deep-backfill repair shreds would
-        // thrash the deshredder's dedup window; those slots are served by the
-        // complete lane below.
-        if slot + 1_000 >= tip {
-            let mut fast = self.fast.lock().unwrap_or_else(|e| e.into_inner());
-            fast.total += 1;
-            // The deshredder has no clock: the same 1_000-slot window that
-            // gates admission above is what bounds its memory.
-            fast.deshredder.evict_below(tip.saturating_sub(1_000));
-            let mut events = std::mem::take(&mut fast.events);
-            events.clear();
-            fast.deshredder.push(bytes, &mut events);
-            // Wire contract: `complete = true` rides on the batch that finished
-            // the slot. Batches and completion are separate events, so hold
-            // each batch until we know whether completion follows it.
-            let mut pending: Option<(u64, Vec<Entry>)> = None;
-            for ev in events.drain(..) {
-                match ev {
-                    Event::Entries { slot, entries } => {
-                        if let Some((s, e)) = pending.replace((slot, entries)) {
-                            self.publish(s, e, false);
-                            fast.published += 1;
-                        }
-                    }
-                    Event::SlotComplete { slot } => {
-                        self.meter
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .mark_complete(slot, Instant::now());
-                        let mut fc = self.fast_complete.lock().unwrap_or_else(|e| e.into_inner());
-                        fc.insert(slot);
-                        // ponytail: leak guard — the complete lane removes each
-                        // entry as it resolves the slot; clear if that ever stalls.
-                        if fc.len() > 65_536 {
-                            fc.clear();
-                        }
-                        drop(fc);
-                        let entries = match pending.take() {
-                            Some((s, e)) if s == slot => e,
-                            other => { if let Some((s, e)) = other { self.publish(s, e, false); } Vec::new() }
-                        };
-                        self.publish(slot, entries, true);
-                        fast.published += 1;
-                    }
-                    // Next step: carry the footer on the proto so consumers
-                    // get the bank hash without waiting for votes.
-                    Event::Footer { slot, bank_hash, producer_time_nanos } => {
-                        fast.footers += 1;
-                        let _ = self.footer_tx.send(ProtoFooter {
-                            slot,
-                            bank_hash: bank_hash.to_bytes().to_vec(),
-                            producer_time_nanos,
-                        });
-                    }
-                    Event::UndecodableBatch { slot, first_index, last_index } => {
-                        eprintln!("[fast] slot {slot}: shreds {first_index}..={last_index} did not decode as a BlockComponent");
-                    }
-                }
-            }
-            if let Some((s, e)) = pending.take() {
-                self.publish(s, e, false);
-                fast.published += 1;
-            }
-            fast.events = events;
-            if fast.last_log.elapsed() >= Duration::from_secs(10) {
-                eprintln!(
-                    "[fast] shreds={} published={} footers={} tip={} assembler_slots={} \
-                     sigverify[ok={} rejected={} dropped_no_leader={}]",
-                    fast.total,
-                    fast.published,
-                    fast.footers,
-                    tip,
-                    fast.deshredder.active_slots(),
-                    self.sv_verified.load(Ordering::Relaxed),
-                    self.sv_rejected.load(Ordering::Relaxed),
-                    self.sv_no_leader.load(Ordering::Relaxed),
-                );
-                fast.last_log = Instant::now();
-            }
-        }
+        self.tip.fetch_max(slot, Ordering::Relaxed);
+        self.stats.lock().unwrap_or_else(|e| e.into_inner()).admitted += 1;
         true
     }
 
-    /// A targeted slot reached `is_full()` in the Blockstore. Emit it as ONE
-    /// whole-slot message — unless the fast lane already streamed the slot to
-    /// completion, in which case subscribers hold every batch and a re-send
-    /// would duplicate entries.
-    fn on_complete_block(&self, slot: u64, entries: Vec<Entry>) {
-        self.meter
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .mark_complete(slot, Instant::now());
-
-        if let Ok(mut guard) = self.oracle.lock() {
-            if let Some(sampler) = guard.as_mut() {
-                let sigs: HashSet<String> = entries
-                    .iter()
-                    .flat_map(|e| &e.transactions)
-                    .filter_map(|tx| tx.signatures.first())
-                    .map(|s| s.to_string())
-                    .collect();
-                sampler.on_complete(slot, &sigs);
+    /// Wire contract: `complete = true` rides on the batch that finished the
+    /// slot. Batches and completion are separate events, so hold each batch
+    /// until we know whether completion follows it.
+    fn on_events(&self, events: Vec<Event>) {
+        let oracle_on = self.oracle.lock().map(|g| g.is_some()).unwrap_or(false);
+        let mut pending: Option<(u64, Vec<Entry>)> = None;
+        let mut published = 0u64;
+        let mut footers = 0u64;
+        for ev in events {
+            match ev {
+                Event::Entries { slot, entries } => {
+                    if oracle_on {
+                        let mut m = self.slot_sigs.lock().unwrap_or_else(|e| e.into_inner());
+                        // ponytail: leak guard — a slot that never completes stays here.
+                        if m.len() > 4_096 { m.clear(); }
+                        m.entry(slot).or_default().extend(
+                            entries.iter().flat_map(|e| &e.transactions)
+                                .filter_map(|tx| tx.signatures.first()).map(|s| s.to_string()));
+                    }
+                    if let Some((s, e)) = pending.replace((slot, entries)) {
+                        self.publish(s, e, false);
+                        published += 1;
+                    }
+                }
+                Event::SlotComplete { slot } => {
+                    self.meter
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .mark_complete(slot, Instant::now());
+                    if oracle_on {
+                        let sigs = self.slot_sigs.lock().unwrap_or_else(|e| e.into_inner())
+                            .remove(&slot).unwrap_or_default();
+                        if let Ok(mut guard) = self.oracle.lock() {
+                            if let Some(sampler) = guard.as_mut() {
+                                sampler.on_complete(slot, &sigs);
+                            }
+                        }
+                    }
+                    let entries = match pending.take() {
+                        Some((s, e)) if s == slot => e,
+                        other => { if let Some((s, e)) = other { self.publish(s, e, false); published += 1; } Vec::new() }
+                    };
+                    self.publish(slot, entries, true);
+                    published += 1;
+                }
+                Event::Footer { slot, bank_hash, producer_time_nanos } => {
+                    footers += 1;
+                    let _ = self.footer_tx.send(ProtoFooter {
+                        slot,
+                        bank_hash: bank_hash.to_bytes().to_vec(),
+                        producer_time_nanos,
+                    });
+                }
+                Event::UndecodableBatch { slot, first_index, last_index } => {
+                    eprintln!("[stream] slot {slot}: shreds {first_index}..={last_index} did not decode as a BlockComponent");
+                }
             }
         }
-
-        let fast_done = self
-            .fast_complete
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&slot);
-        if fast_done {
-            return;
+        if let Some((s, e)) = pending.take() {
+            self.publish(s, e, false);
+            published += 1;
         }
-
-        if let Ok(bytes) = wincode::serialize(&entries) {
-            let _ = self.entry_tx.send(ProtoEntry { slot, entries: bytes, complete: true });
+        let mut st = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        st.published += published;
+        st.footers += footers;
+        if st.last_log.elapsed() >= Duration::from_secs(10) {
+            eprintln!(
+                "[stream] admitted={} published={} footers={} tip={} \
+                 sigverify[ok={} rejected={} dropped_no_leader={}]",
+                st.admitted,
+                st.published,
+                st.footers,
+                self.tip.load(Ordering::Relaxed),
+                self.sv_verified.load(Ordering::Relaxed),
+                self.sv_rejected.load(Ordering::Relaxed),
+                self.sv_no_leader.load(Ordering::Relaxed),
+            );
+            st.last_log = Instant::now();
         }
-        self.emit_txs(slot, &entries, true);
     }
 
     /// The slot was never produced. Emit an EMPTY Entry message so an in-order
@@ -574,10 +534,6 @@ impl BlockSink for ColibriSink {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .mark_complete(slot, Instant::now());
-        self.fast_complete
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&slot);
         if let Ok(bytes) = wincode::serialize(&Vec::<Entry>::new()) {
             let _ = self.entry_tx.send(ProtoEntry { slot, entries: bytes, complete: true });
         }
@@ -622,6 +578,16 @@ fn main() -> Result<()> {
         None       => eprintln!("[colibri] advertise ip:  {}", cfg.ip),
     }
     eprintln!("[colibri] rpc:           {}", cfg.rpc_url);
+    eprintln!("[colibri] entrypoints:   {}", cfg.entrypoints.len());
+    if cfg.entrypoints.len() < 3 {
+        // --entrypoint REPLACES the list. One or two is the stall mode: a
+        // single slow entrypoint leaves gossip at peers=0 indefinitely.
+        eprintln!(
+            "[colibri] WARNING: only {} entrypoint(s) — one dead entrypoint stalls gossip \
+             (peers=0). Pass several, or omit --entrypoint for the built-in mainnet five.",
+            cfg.entrypoints.len()
+        );
+    }
     eprintln!("[colibri] grpc port:     {}", cfg.grpc_port);
     eprintln!("[colibri] auth:          {}", if cfg.auth_token.is_some() { "token required" } else { "open (no auth)" });
     eprintln!("[colibri] tier1-fanout:  {}", cfg.tier1_fanout);
@@ -796,13 +762,11 @@ fn main() -> Result<()> {
         })));
 
     let sink = Arc::new(ColibriSink {
-        fast: Mutex::new(FastLane {
-            deshredder: Deshredder::new(),
-            events:     Vec::new(),
-            footers:    0,
+        stats: Mutex::new(Stats {
             last_log:   Instant::now(),
-            total:      0,
+            admitted:   0,
             published:  0,
+            footers:    0,
         }),
         leader_sched:  leader_sched.clone(),
         sv_verified:   AtomicU64::new(0),
@@ -813,7 +777,7 @@ fn main() -> Result<()> {
         footer_tx,
         meter:         meter.clone(),
         oracle:        oracle_sampler.clone(),
-        fast_complete: Mutex::new(HashSet::new()),
+        slot_sigs:     Mutex::new(HashMap::new()),
         tip:           AtomicU64::new(0),
     });
 
@@ -827,7 +791,7 @@ fn main() -> Result<()> {
             stun_server:   cfg.stun_server.clone(),
             shred_version: cfg.shred_version,
             entrypoints:   cfg.entrypoints.clone(),
-            // Retain enough Blockstore history that a slow-completing backlog
+            // Retain enough assembler history that a slow-completing backlog
             // slot near the consumer's floor isn't janitor-purged before it
             // finishes (the gap can be larger than --depth when driven by
             // from-slot).
