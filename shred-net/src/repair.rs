@@ -2,10 +2,10 @@
 //!
 //! Pure decision core, re-seamed onto [`crate::reconstruct::Reconstructor`]: the
 //! driver feeds in the slot's reconstruction state (`is_full`, `last_index`, and
-//! the `missing` data-shred indices the Blockstore reports) and gets back the
+//! the `missing` data-shred indices the assembler reports) and gets back the
 //! single action to take this cycle. Ported from Colibri's Phase-0-proven
-//! `next_repair_action`, but its inputs now come from the Blockstore's `SlotMeta`
-//! rather than a hand-rolled `HashSet`/`last_index` tracker.
+//! `next_repair_action`, but its inputs now come from the deshredder's gap
+//! report rather than a hand-rolled `HashSet`/`last_index` tracker.
 
 /// Actions the repair driver may take for a single slot in one cycle.
 #[derive(Debug, PartialEq, Eq)]
@@ -24,7 +24,7 @@ pub enum RepairAction {
 
 /// Pure, unit-testable repair-decision function.
 ///
-/// * `is_full`        — the Blockstore says every data shred `0..=last_index` is present.
+/// * `is_full`        — the assembler emitted every batch through LAST_IN_SLOT.
 /// * `last_index`     — final shred index, or `None` if no `LAST_IN_SLOT` shred yet.
 /// * `missing`        — missing data-shred indices (from `find_missing_data_indexes`).
 /// * `highest_probed` — whether a `HighestWindowIndex` was already sent.

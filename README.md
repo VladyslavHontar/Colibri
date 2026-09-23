@@ -10,8 +10,8 @@ Two lanes over one ingest:
 
 1. **Gossip** — Colibri joins the Solana gossip network and discovers validators (the `shred-net` workspace crate)
 2. **TVU** — Receives raw shred packets from the Turbine tree; every shred is verified against the slot leader's signature (fail-closed)
-3. **Fast lane** — Verified shreds go straight into the in-memory [deshredder](https://github.com/VladyslavHontar/Deshreder) (Reed-Solomon FEC recovery); entry batches stream out with minimal latency, `complete = true` on the batch that finishes a slot
-4. **Complete lane** — `shred-net` drives the repair protocol until every targeted slot is fully reconstructed, emitting whole blocks the fast lane missed and empty-entry skip markers for slots that were never produced; the targeted range follows the consumer's `from-slot` frontier, falling back to `tip - depth`
+3. **Assemble** — Verified shreds, turbine and repair alike, go into one in-memory [deshredder](https://github.com/VladyslavHontar/Deshreder) (Reed-Solomon FEC recovery); entry batches stream out the moment they are contiguous, `complete = true` on the batch that finishes a slot
+4. **Repair** — `shred-net` asks the deshredder which shreds are missing and drives the repair protocol until every targeted slot is complete, emitting empty-entry skip markers for slots that were never produced; the targeted range follows the consumer's `from-slot` frontier, falling back to `tip - depth`
 5. **gRPC** — Streams individual transactions (and raw entries) to subscribers
 
 ## Build

@@ -1,5 +1,5 @@
 # colibri — the node binary (gossip + TVU ingest + sigverify + repair + gRPC).
-# shred-net — the P2P complete lane (gossip join, repair protocol, Blockstore
+# shred-net — the P2P layer (gossip join, repair protocol, deshredder
 #             reconstruction) embedded by colibri.
 # The deshredder assembly library is the standalone open-source Deshreder repo.
 [workspace]
@@ -8,7 +8,8 @@ resolver = "2"
 
 [workspace.dependencies]
 # Deshredder now uses agave v4.3.0 (agave-unstable-api feature exposes the shred module).
-# Colibri gossip also uses agave v4.3.0 → one rocksdb build (anza fork, see [patch.crates-io]), no native lib conflict.
+# Colibri gossip also uses agave v4.3.0. Nothing here uses rocksdb at run time any more, but
+# solana-gossip depends on solana-ledger, so the anza rocksdb fork ([patch.crates-io]) still builds.
 bincode = "1"
 tokio   = { version = "1", features = ["full"] }
 anyhow  = "1"

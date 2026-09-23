@@ -15,8 +15,8 @@
 //! NB: pass SEVERAL entrypoints — a single dead one stalls gossip forever.
 
 use {
+    deshredder::Event,
     shred_net::{BlockSink, ShredNet, ShredNetConfig},
-    solana_entry::entry::Entry,
     solana_keypair::{read_keypair_file, Keypair},
     solana_signer::Signer,
     std::{
@@ -38,10 +38,17 @@ struct CoverageSink {
 }
 
 impl BlockSink for CoverageSink {
-    fn on_complete_block(&self, _slot: u64, entries: Vec<Entry>) {
-        self.completed.fetch_add(1, Ordering::Relaxed);
-        let n: usize = entries.iter().map(|e| e.transactions.len()).sum();
-        self.txs.fetch_add(n as u64, Ordering::Relaxed);
+    fn on_events(&self, events: Vec<Event>) {
+        for ev in events {
+            match ev {
+                Event::Entries { entries, .. } => {
+                    let n: usize = entries.iter().map(|e| e.transactions.len()).sum();
+                    self.txs.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                Event::SlotComplete { .. } => { self.completed.fetch_add(1, Ordering::Relaxed); }
+                _ => {}
+            }
+        }
     }
     fn on_slot_skipped(&self, _slot: u64) {
         self.skipped.fetch_add(1, Ordering::Relaxed);

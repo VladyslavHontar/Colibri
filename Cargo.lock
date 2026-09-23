@@ -1414,7 +1414,6 @@ dependencies = [
  "serde_json",
  "shred-net",
  "solana-keypair",
- "solana-ledger",
  "solana-pubkey 4.3.0",
  "solana-signature",
  "solana-signer",
@@ -1844,9 +1843,10 @@ dependencies = [
 [[package]]
 name = "deshredder"
 version = "0.2.0"
-source = "git+https://github.com/VladyslavHontar/Deshreder.git?rev=081c1d2a425a3b3f6c9d67f2a558b0e0fda607a3#081c1d2a425a3b3f6c9d67f2a558b0e0fda607a3"
+source = "git+https://github.com/VladyslavHontar/Deshreder.git?rev=f2044c43e9a6b8e31ab674550c17ee2dea7bc1b0#f2044c43e9a6b8e31ab674550c17ee2dea7bc1b0"
 dependencies = [
  "reed-solomon-erasure",
+ "sha2 0.10.9",
  "solana-entry",
  "solana-hash",
  "wincode",
@@ -4993,6 +4993,7 @@ name = "shred-net"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "deshredder",
  "env_logger",
  "log",
  "sha2 0.10.9",
@@ -5008,7 +5009,6 @@ dependencies = [
  "solana-signer",
  "solana-streamer",
  "solana-time-utils",
- "tempfile",
 ]
 
 [[package]]

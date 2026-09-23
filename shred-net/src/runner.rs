@@ -4,14 +4,14 @@
 //!
 //! Threading (all `std::thread`, no imposed async runtime — Colibri embeds
 //! this). The ingest path is decoupled from dispatch so a slow
-//! rocksdb write never stalls socket draining or request pacing:
+//! assembly never stalls socket draining or request pacing:
 //!   - gossip threads (owned by `GossipService`)
 //!   - TVU recv      — recv turbine shreds → insert channel + fast-lane hook
 //!   - repair recv   — recv repair socket: ping→pong inline, shred→insert channel
-//!                     (NO rocksdb on this thread, so it drains continuously and
+//!                     (no assembly on this thread, so it drains continuously and
 //!                     never drops bursts)
-//!   - insert worker — drain the channel and `insert_batch` into the Blockstore,
-//!                     amortizing the rocksdb lock/commit over up to MAX_BATCH
+//!   - insert worker — drain the channel and `insert_batch` into the assembler,
+//!                     amortizing its lock over up to MAX_BATCH
 //!                     shreds per call (the throughput lever)
 //!   - dispatch      — timer-paced: admit targets, pick peers, send repair
 //!                     requests, emit completed blocks, prune
@@ -30,7 +30,7 @@ use {
         repair::{next_repair_action, RepairAction},
         wire,
     },
-    solana_entry::entry::Entry,
+    deshredder::Event,
     solana_keypair::Keypair,
     std::{
         collections::{HashMap, HashSet, VecDeque},
@@ -45,23 +45,24 @@ use {
     },
 };
 
-/// Max shreds coalesced into a single `insert_batch` (rocksdb commit) call.
+/// Max shreds coalesced into a single `insert_batch` (one assembler lock) call.
 const MAX_BATCH: usize = 1024;
 /// Bounded insert-channel capacity. Full ⇒ insert worker is the bottleneck.
 const INSERT_CHAN_CAP: usize = 65_536;
 
 /// Receives reconstructed blocks (and, optionally, the raw fast-lane shred feed).
 pub trait BlockSink: Send + Sync + 'static {
-    /// A targeted slot reached `is_full()`; `entries` is the complete block.
-    fn on_complete_block(&self, slot: u64, entries: Vec<Entry>);
+    /// Assembler output for one insert batch, in order: entry batches as soon
+    /// as they are contiguous (turbine or repair alike), block footers, and
+    /// `SlotComplete` after a slot's last batch. Default: ignore.
+    fn on_events(&self, _events: Vec<Event>) {}
     /// A targeted slot was determined to be **skipped** — no block was ever
     /// produced for it, so there is nothing to reconstruct. Consumers should
     /// treat it as "accounted for" (advance replay past it). Default: ignore.
     fn on_slot_skipped(&self, _slot: u64) {}
-    /// Every raw shred as it arrives (turbine + repair), BEFORE it is inserted
-    /// into the Blockstore or advances the observed tip. Return `false` to
-    /// drop the packet entirely (fail-closed sigverify gate); `true` to admit.
-    /// Colibri's fast lane verifies + deshreds here. Default: admit.
+    /// Every raw shred as it arrives (turbine + repair), BEFORE it reaches the
+    /// assembler or advances the observed tip. Return `false` to drop the
+    /// packet entirely (fail-closed sigverify gate); `true` to admit.
     fn on_raw_shred(&self, _bytes: &[u8]) -> bool {
         true
     }
@@ -123,7 +124,7 @@ struct Diag {
 }
 
 /// Per-targeted-slot driver bookkeeping (the have/last_index/is_full state lives
-/// in the Blockstore via `Reconstructor`; only repair *policy* state is here).
+/// in the assembler via `Reconstructor`; only repair *policy* state is here).
 struct DriverState {
     last_repair:    Instant,
     repair_rounds:  u32,
@@ -207,7 +208,7 @@ impl ShredNet {
             exit.clone(),
         )?;
 
-        let reconstructor = Arc::new(Reconstructor::new()?);
+        let reconstructor = Arc::new(Reconstructor::new());
         let targets: Arc<Mutex<VecDeque<u64>>> = Arc::new(Mutex::new(VecDeque::new()));
         let stakes: Arc<Mutex<HashMap<[u8; 32], u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let observed_tip = Arc::new(AtomicU64::new(0));
@@ -254,6 +255,7 @@ impl ShredNet {
             exit.clone(),
             insert_rx,
             reconstructor.clone(),
+            sink.clone(),
             diag.clone(),
         ));
         handles.push(spawn_dispatch(
@@ -353,7 +355,7 @@ fn spawn_tvu(
                 Ok((n, _)) => {
                     let bytes = &buf[..n];
                     // Fail-closed: an unadmitted (unverified) shred neither
-                    // advances the tip nor reaches the Blockstore.
+                    // advances the tip nor reaches the assembler.
                     if sink.on_raw_shred(bytes) {
                         if let Some(slot) = slot_of(bytes) {
                             observed_tip.fetch_max(slot, Ordering::Relaxed);
@@ -373,8 +375,7 @@ fn spawn_tvu(
 }
 
 /// Drains the repair socket continuously — pong replies inline (cheap), shred
-/// responses handed to the insert worker. No rocksdb here, so a slow write can
-/// never stall draining and drop a burst.
+/// responses handed to the insert worker, so assembly never stalls draining.
 fn spawn_repair_recv(
     repair_sock: Arc<UdpSocket>,
     exit: Arc<AtomicBool>,
@@ -415,16 +416,18 @@ fn spawn_repair_recv(
     })
 }
 
-/// Batches shreds off the channel into the Blockstore — one `insert_batch`
-/// (rocksdb commit) per up-to-MAX_BATCH shreds, instead of one per shred.
+/// Batches shreds off the channel into the assembler — one lock per
+/// up-to-MAX_BATCH shreds — and hands whatever came out to the sink.
 fn spawn_insert_worker(
     exit: Arc<AtomicBool>,
     insert_rx: Receiver<Vec<u8>>,
     reconstructor: Arc<Reconstructor>,
+    sink: Arc<dyn BlockSink>,
     diag: Arc<Diag>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut batch: Vec<Vec<u8>> = Vec::with_capacity(MAX_BATCH);
+        let mut events: Vec<Event> = Vec::new();
         loop {
             if exit.load(Ordering::Relaxed) {
                 break;
@@ -441,8 +444,11 @@ fn spawn_insert_worker(
                     Err(_) => break,
                 }
             }
-            let n = reconstructor.insert_batch(&batch);
+            let n = reconstructor.insert_batch(&batch, &mut events);
             diag.inserted.fetch_add(n as u64, Ordering::Relaxed);
+            if !events.is_empty() {
+                sink.on_events(std::mem::take(&mut events));
+            }
         }
     })
 }
@@ -549,12 +555,10 @@ fn spawn_dispatch(
 
                     match action {
                         RepairAction::Complete => {
-                            // Read the parent BEFORE purging — slots between it and
-                            // this one were never produced (skip detection).
+                            // The entries already left through `on_events`;
+                            // slots between the parent and this one were never
+                            // produced (skip detection).
                             let parent = reconstructor.parent_slot(slot);
-                            if let Some(entries) = reconstructor.take_complete(slot) {
-                                sink.on_complete_block(slot, entries);
-                            }
                             done.push(slot);
                             if let Some(p) = parent {
                                 reveal.push((slot, p));
@@ -632,7 +636,7 @@ fn spawn_dispatch(
                 }
             }
 
-            // ── janitor: bound the ephemeral store ──
+            // ── janitor: bound the assembler ──
             if last_purge.elapsed() >= Duration::from_secs(5) {
                 let tip = observed_tip.load(Ordering::Relaxed);
                 if tip > keep_window {
@@ -653,16 +657,28 @@ fn spawn_dispatch(
                         full += 1;
                     }
                 }
+                // Per-slot view of the three oldest in-flight slots.
+                let mut oldest: Vec<u64> = driver.keys().copied().collect();
+                oldest.sort_unstable();
+                for slot in oldest.iter().take(3) {
+                    let st = &driver[slot];
+                    let missing = reconstructor.missing_indices(*slot, 8);
+                    eprintln!(
+                        "[shred-net]   slot {slot}: last_index={:?} received={:?} full={} rounds={} retries={} probed={} missing[..8]={:?}",
+                        reconstructor.last_index(*slot), reconstructor.received(*slot), reconstructor.is_full(*slot),
+                        st.repair_rounds, st.retries, st.highest_probed, missing,
+                    );
+                }
                 let take = |c: &AtomicU64| c.swap(0, Ordering::Relaxed) as f64 / secs;
                 eprintln!(
                     "[shred-net] driver={} peers={} skipped={} | reqs/s={:.0} resp/s={:.0} inserted/s={:.0} \
                      chan_drop/s={:.0} send_err/s={:.0} pings/s={:.0} pongs/s={:.0} | \
-                     last_idx_known={}/{} full_in_map={}",
+                     last_idx_known={}/{} full_in_map={} asm_slots={}",
                     driver.len(), peers.len(), skipped.len(),
                     take(&diag.reqs), take(&diag.resp), take(&diag.inserted),
                     take(&diag.chan_drop), take(&diag.send_err),
                     take(&diag.pings), take(&diag.pongs),
-                    known, driver.len(), full,
+                    known, driver.len(), full, reconstructor.active_slots(),
                 );
                 last_diag = Instant::now();
             }

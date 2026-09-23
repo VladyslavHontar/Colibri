@@ -9,16 +9,12 @@ path = "src/main.rs"
 
 [dependencies]
 # Deshredder — the standalone shred→entries assembly library (fast lane).
-deshredder = { git = "https://github.com/VladyslavHontar/Deshreder.git", rev = "081c1d2a425a3b3f6c9d67f2a558b0e0fda607a3" }
+deshredder = { git = "https://github.com/VladyslavHontar/Deshreder.git", rev = "f2044c43e9a6b8e31ab674550c17ee2dea7bc1b0" }
 
 # The P2P complete lane: gossip join + repair protocol + Blockstore
 # reconstruction (workspace member).
 shred-net = { path = "../shred-net" }
 
-# solana-ledger: reused ONLY for faithful shred sigverify (shred::layout merkle-root
-# extraction). agave-unstable-api exposes the `shred` module — same feature and
-# agave tag (v4.3.0) as deshredder, so no extra rocksdb build / native lib conflict.
-solana-ledger = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0", features = ["agave-unstable-api"] }
 
 # Pin leaf crates to the exact agave v4.3.0 workspace versions.
 # (The gossip/repair/reconstruction stack lives in the shred-net crate.)
