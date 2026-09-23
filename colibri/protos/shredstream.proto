@@ -22,10 +22,23 @@ message Transaction {
     bool   complete   = 4;
 }
 
+// Alpenglow block footer (SIMD-0326): the leader's own bank hash and clock for
+// the block, carried in the block itself. Under Alpenglow votes never touch the
+// chain, so this is the earliest — and the only in-band — source of both.
+// `bank_hash` is what the leader executed, not a stake-weighted confirmation;
+// finalization travels as certificates.
+message Footer {
+    uint64 slot                = 1;
+    bytes  bank_hash           = 2; // 32 bytes
+    uint64 producer_time_nanos = 3; // leader wall clock, ns since the Unix epoch
+}
+
 message SubscribeEntriesRequest {}
 message SubscribeTransactionsRequest {}
+message SubscribeFootersRequest {}
 
 service ShredstreamProxy {
     rpc SubscribeEntries(SubscribeEntriesRequest) returns (stream Entry);
     rpc SubscribeTransactions(SubscribeTransactionsRequest) returns (stream Transaction);
+    rpc SubscribeFooters(SubscribeFootersRequest) returns (stream Footer);
 }
