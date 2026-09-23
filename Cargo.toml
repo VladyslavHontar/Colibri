@@ -19,6 +19,12 @@ anyhow  = "1"
 lto           = "off"
 codegen-units = 1
 
+# solana-ledger crashes rustc/LLVM with SIGBUS (stack-overflowing SCEV
+# recursion) under codegen-units = 1 + opt-level = 3. More codegen units
+# split its functions across LLVM modules and avoid the pathological case.
+[profile.release.package.solana-ledger]
+codegen-units = 16
+
 # agave v4.3.0 does not build against the crates.io rocksdb: its blockstore_db
 # calls `new_pinnable_slice` / `get_pinned_cf_into` / `DBPinnableSlice::reset`,
 # which exist only in anza's fork. Agave declares the fork as a normal workspace

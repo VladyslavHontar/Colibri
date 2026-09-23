@@ -2,3 +2,6 @@
 .DS_Store
 .idea/
 /target/
+# per-machine runtime config (copy colibri.example.json)
+colibri.json
+colibri-identity.json

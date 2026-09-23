@@ -72,7 +72,7 @@ pub fn join(
     let gossip_addr = match &cfg.stun_server {
         Some(server) => {
             let mapped = crate::stun::external_addr(&gossip_socket, server)?;
-            if mapped.ip() != cfg.advertise_ip {
+            if !cfg.advertise_ip.is_unspecified() && mapped.ip() != cfg.advertise_ip {
                 log::warn!(
                     "[shred-net] STUN reports {} but --ip says {}; advertising the \
                      STUN address",

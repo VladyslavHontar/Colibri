@@ -29,6 +29,9 @@ solana-signature  = { version = "=3.5.2", default-features = false }
 
 # gRPC
 tonic = { version = "0.12", features = ["tls"] }
+# RPC calls (leader schedule, epoch schedule, tier-1 stakes). Explicit rustls so
+# `--rpc https://…` works; the TLS stack is shared with tonic's `tls` feature.
+ureq = { version = "3", features = ["rustls"] }
 prost = "0.13"
 # agave 4.3.0 serialises `Entry` with wincode, not serde. Byte-compatible with
 # bincode, so the emitted gRPC payload is unchanged for subscribers.

@@ -103,7 +103,9 @@ impl Default for ShredNetConfig {
             stun_server: None,
             keep_window: 8_000,
             target_window: 64,
-            top_peers: 64,
+            // 128, not 64: measured 2026-09-23, response yield per request
+            // 14.5% → 27.9% and completed slots 235 → 365 in 170 s.
+            top_peers: 128,
         }
     }
 }
@@ -581,6 +583,15 @@ fn spawn_dispatch(
                         RepairAction::RequestWindows(batch) => {
                             state.last_repair = Instant::now();
                             state.repair_rounds += 1;
+                            // Deliberately NO outstanding-request dedup here.
+                            // Measured 2026-09-23 (170 s runs, depth 500):
+                            // serve_repair answers ~15% of an unstaked
+                            // requester's requests at 64 peers regardless of
+                            // rate, so agave's own 150 ms re-ask timeout
+                            // halved requests and completed slots with it
+                            // (377 → 235). Re-sending is how a low-stake node
+                            // gets through load shedding. Spreading over more
+                            // peers is what raised the yield (28% at 128).
                             // Ask ONE peer per missing index (rotate across peers
                             // and rounds). Broadcasting every index to all peers is
                             // ~Nx redundant and trips serve_repair's per-requester
