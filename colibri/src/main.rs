@@ -27,7 +27,7 @@ mod sigverify;
 
 use {
     anyhow::Result,
-    deshredder::{Deshredder, Entry},
+    deshredder::{Deshredder, Entry, Event},
     serde_json::Value,
     server::{ProtoEntry, ProtoTransaction},
     shred_net::{BlockSink, ShredNet, ShredNetConfig},
@@ -280,7 +280,8 @@ mod shred_slot_tests {
 /// Mutable fast-lane state, locked once per admitted near-tip shred.
 struct FastLane {
     deshredder: Deshredder,
-    last_evict: Instant,
+    /// Reused across pushes so the quiet path allocates nothing.
+    events:     Vec<Event>,
     last_log:   Instant,
     total:      u64,
     published:  u64,
@@ -307,6 +308,22 @@ struct ColibriSink {
 }
 
 impl ColibriSink {
+    /// Serialize one batch and fan it out to both streams. `complete` marks
+    /// the batch that finished the slot (see `Entry.complete` in the proto).
+    /// wincode is byte-compatible with bincode, so subscribers keep decoding
+    /// the payload exactly as before.
+    fn publish(&self, slot: u64, entries: Vec<Entry>, complete: bool) {
+        let bytes = match wincode::serialize(&entries) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[fast] slot {slot}: wincode::serialize failed: {e}");
+                return;
+            }
+        };
+        let _ = self.entry_tx.send(ProtoEntry { slot, entries: bytes, complete });
+        self.emit_txs(slot, &entries, complete);
+    }
+
     fn emit_txs(&self, slot: u64, entries: &[Entry], complete: bool) {
         // Per-tx base58 + bincode is the most expensive work here; skip it
         // entirely when nothing consumes it.
@@ -365,41 +382,65 @@ impl BlockSink for ColibriSink {
         if slot + 1_000 >= tip {
             let mut fast = self.fast.lock().unwrap_or_else(|e| e.into_inner());
             fast.total += 1;
-            if fast.last_evict.elapsed() >= Duration::from_millis(100) {
-                fast.deshredder.evict_expired();
-                fast.last_evict = Instant::now();
-            }
-            if let Some(se) = fast.deshredder.push_raw(bytes) {
-                if se.complete {
-                    self.meter
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .mark_complete(se.slot, Instant::now());
-                    let mut fc = self.fast_complete.lock().unwrap_or_else(|e| e.into_inner());
-                    fc.insert(se.slot);
-                    // ponytail: leak guard — the complete lane removes each
-                    // entry as it resolves the slot; clear if that ever stalls.
-                    if fc.len() > 65_536 {
-                        fc.clear();
+            // The deshredder has no clock: the same 1_000-slot window that
+            // gates admission above is what bounds its memory.
+            fast.deshredder.evict_below(tip.saturating_sub(1_000));
+            let mut events = std::mem::take(&mut fast.events);
+            events.clear();
+            fast.deshredder.push(bytes, &mut events);
+            // Wire contract: `complete = true` rides on the batch that finished
+            // the slot. Batches and completion are separate events, so hold
+            // each batch until we know whether completion follows it.
+            let mut pending: Option<(u64, Vec<Entry>)> = None;
+            for ev in events.drain(..) {
+                match ev {
+                    Event::Entries { slot, entries } => {
+                        if let Some((s, e)) = pending.replace((slot, entries)) {
+                            self.publish(s, e, false);
+                            fast.published += 1;
+                        }
+                    }
+                    Event::SlotComplete { slot } => {
+                        self.meter
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .mark_complete(slot, Instant::now());
+                        let mut fc = self.fast_complete.lock().unwrap_or_else(|e| e.into_inner());
+                        fc.insert(slot);
+                        // ponytail: leak guard — the complete lane removes each
+                        // entry as it resolves the slot; clear if that ever stalls.
+                        if fc.len() > 65_536 {
+                            fc.clear();
+                        }
+                        drop(fc);
+                        let entries = match pending.take() {
+                            Some((s, e)) if s == slot => e,
+                            other => { if let Some((s, e)) = other { self.publish(s, e, false); } Vec::new() }
+                        };
+                        self.publish(slot, entries, true);
+                        fast.published += 1;
+                    }
+                    // Next step: carry the footer on the proto so consumers
+                    // get the bank hash without waiting for votes.
+                    Event::Footer { .. } => {}
+                    Event::UndecodableBatch { slot, first_index, last_index } => {
+                        eprintln!("[fast] slot {slot}: shreds {first_index}..={last_index} did not decode as a BlockComponent");
                     }
                 }
-                let _ = self.entry_tx.send(ProtoEntry {
-                    slot:     se.slot,
-                    entries:  se.entries_bytes,
-                    complete: se.complete,
-                });
-                self.emit_txs(se.slot, &se.entries, se.complete);
+            }
+            if let Some((s, e)) = pending.take() {
+                self.publish(s, e, false);
                 fast.published += 1;
             }
+            fast.events = events;
             if fast.last_log.elapsed() >= Duration::from_secs(10) {
                 eprintln!(
-                    "[fast] shreds={} published={} tip={} assembler_slots={} dedup_slots={} \
+                    "[fast] shreds={} published={} tip={} assembler_slots={} \
                      sigverify[ok={} rejected={} dropped_no_leader={}]",
                     fast.total,
                     fast.published,
                     tip,
-                    fast.deshredder.active_slot_count(),
-                    fast.deshredder.tracked_slot_count(),
+                    fast.deshredder.active_slots(),
                     self.sv_verified.load(Ordering::Relaxed),
                     self.sv_rejected.load(Ordering::Relaxed),
                     self.sv_no_leader.load(Ordering::Relaxed),
@@ -669,8 +710,8 @@ fn main() -> Result<()> {
 
     let sink = Arc::new(ColibriSink {
         fast: Mutex::new(FastLane {
-            deshredder: Deshredder::new(30_000, 200),
-            last_evict: Instant::now(),
+            deshredder: Deshredder::new(),
+            events:     Vec::new(),
             last_log:   Instant::now(),
             total:      0,
             published:  0,
