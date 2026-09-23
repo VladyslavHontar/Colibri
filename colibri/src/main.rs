@@ -29,7 +29,7 @@ use {
     anyhow::Result,
     deshredder::{Deshredder, Entry, Event},
     serde_json::Value,
-    server::{ProtoEntry, ProtoTransaction},
+    server::{ProtoEntry, ProtoFooter, ProtoTransaction},
     shred_net::{BlockSink, ShredNet, ShredNetConfig},
     solana_keypair::{read_keypair_file, write_keypair_file, Keypair},
     solana_pubkey::Pubkey,
@@ -285,6 +285,8 @@ struct FastLane {
     last_log:   Instant,
     total:      u64,
     published:  u64,
+    /// Block footers seen — tells whether Alpenglow markers are live upstream.
+    footers:    u64,
 }
 
 /// Colibri's `BlockSink`: leader-keyed sigverify gate (fail-closed), inline
@@ -297,6 +299,7 @@ struct ColibriSink {
     sv_no_leader:  AtomicU64,
     entry_tx:      Arc<broadcast::Sender<ProtoEntry>>,
     tx_tx:         Arc<broadcast::Sender<ProtoTransaction>>,
+    footer_tx:     Arc<broadcast::Sender<ProtoFooter>>,
     meter:         Arc<Mutex<coverage::CoverageMeter>>,
     oracle:        Arc<Mutex<Option<oracle::OracleSampler>>>,
     /// Slots the fast lane finished — the complete lane skips re-emitting them
@@ -422,7 +425,14 @@ impl BlockSink for ColibriSink {
                     }
                     // Next step: carry the footer on the proto so consumers
                     // get the bank hash without waiting for votes.
-                    Event::Footer { .. } => {}
+                    Event::Footer { slot, bank_hash, producer_time_nanos } => {
+                        fast.footers += 1;
+                        let _ = self.footer_tx.send(ProtoFooter {
+                            slot,
+                            bank_hash: bank_hash.to_bytes().to_vec(),
+                            producer_time_nanos,
+                        });
+                    }
                     Event::UndecodableBatch { slot, first_index, last_index } => {
                         eprintln!("[fast] slot {slot}: shreds {first_index}..={last_index} did not decode as a BlockComponent");
                     }
@@ -435,10 +445,11 @@ impl BlockSink for ColibriSink {
             fast.events = events;
             if fast.last_log.elapsed() >= Duration::from_secs(10) {
                 eprintln!(
-                    "[fast] shreds={} published={} tip={} assembler_slots={} \
+                    "[fast] shreds={} published={} footers={} tip={} assembler_slots={} \
                      sigverify[ok={} rejected={} dropped_no_leader={}]",
                     fast.total,
                     fast.published,
+                    fast.footers,
                     tip,
                     fast.deshredder.active_slots(),
                     self.sv_verified.load(Ordering::Relaxed),
@@ -569,6 +580,9 @@ fn main() -> Result<()> {
     let entry_tx = Arc::new(entry_tx);
     let (tx_tx, _) = broadcast::channel::<ProtoTransaction>(65_536);
     let tx_tx = Arc::new(tx_tx);
+    // One footer per slot; 1_024 covers minutes of backlog for a slow subscriber.
+    let (footer_tx, _) = broadcast::channel::<ProtoFooter>(1_024);
+    let footer_tx = Arc::new(footer_tx);
 
     // Lowest slot a consumer asked to repair from (via `from-slot` metadata).
     let requested_from = Arc::new(AtomicU64::new(0));
@@ -578,8 +592,11 @@ fn main() -> Result<()> {
         let _guard = rt.enter();
         server::start_grpc_server(
             grpc_addr,
-            entry_tx.clone(),
-            tx_tx.clone(),
+            server::Streams {
+                entries: entry_tx.clone(),
+                txs:     tx_tx.clone(),
+                footers: footer_tx.clone(),
+            },
             cfg.auth_token.clone(),
             cfg.tls_cert.clone(),
             cfg.tls_key.clone(),
@@ -712,6 +729,7 @@ fn main() -> Result<()> {
         fast: Mutex::new(FastLane {
             deshredder: Deshredder::new(),
             events:     Vec::new(),
+            footers:    0,
             last_log:   Instant::now(),
             total:      0,
             published:  0,
@@ -722,6 +740,7 @@ fn main() -> Result<()> {
         sv_no_leader:  AtomicU64::new(0),
         entry_tx,
         tx_tx,
+        footer_tx,
         meter:         meter.clone(),
         oracle:        oracle_sampler.clone(),
         fast_complete: Mutex::new(HashSet::new()),

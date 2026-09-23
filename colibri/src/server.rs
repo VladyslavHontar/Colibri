@@ -15,12 +15,14 @@ pub mod shredstream {
 
 use shredstream::{
     shredstream_proxy_server::{ShredstreamProxy, ShredstreamProxyServer},
-    Entry, SubscribeEntriesRequest, Transaction, SubscribeTransactionsRequest,
+    Entry, Footer, SubscribeEntriesRequest, SubscribeFootersRequest, SubscribeTransactionsRequest,
+    Transaction,
 };
 
 pub struct ColibriGrpcService {
-    entry_sender: Arc<Sender<Entry>>,
-    tx_sender:    Arc<Sender<Transaction>>,
+    entry_sender:  Arc<Sender<Entry>>,
+    tx_sender:     Arc<Sender<Transaction>>,
+    footer_sender: Arc<Sender<Footer>>,
     auth_token:   Option<Arc<String>>,
     /// Lowest slot any subscriber asked to repair from (`from-slot` metadata).
     /// 0 = none yet (the frontier loop falls back to `--depth`).
@@ -51,6 +53,7 @@ fn check_auth(auth_token: &Option<Arc<String>>, request_metadata: &tonic::metada
 impl ShredstreamProxy for ColibriGrpcService {
     type SubscribeEntriesStream = ReceiverStream<Result<Entry, Status>>;
     type SubscribeTransactionsStream = ReceiverStream<Result<Transaction, Status>>;
+    type SubscribeFootersStream = ReceiverStream<Result<Footer, Status>>;
 
     async fn subscribe_entries(
         &self,
@@ -136,12 +139,52 @@ impl ShredstreamProxy for ColibriGrpcService {
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+
+    async fn subscribe_footers(
+        &self,
+        request: Request<SubscribeFootersRequest>,
+    ) -> Result<Response<Self::SubscribeFootersStream>, Status> {
+        check_auth(&self.auth_token, request.metadata())?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let mut bcast = self.footer_sender.subscribe();
+
+        tokio::spawn(async move {
+            loop {
+                match bcast.recv().await {
+                    Ok(footer) => match tx.try_send(Ok(footer)) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            eprintln!("[grpc] footers subscriber too slow, disconnecting");
+                            break;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                    },
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        eprintln!("[grpc] footers subscriber lagged by {n}, disconnecting");
+                        let _ = tx.try_send(Err(Status::data_loss(format!("stream lagged: {n} footers dropped"))));
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+/// The three broadcast fan-outs the gRPC service serves. One struct because
+/// they are always created and passed together.
+pub struct Streams {
+    pub entries: Arc<Sender<Entry>>,
+    pub txs:     Arc<Sender<Transaction>>,
+    pub footers: Arc<Sender<Footer>>,
 }
 
 pub fn start_grpc_server(
     addr:           SocketAddr,
-    entry_sender:   Arc<Sender<Entry>>,
-    tx_sender:      Arc<Sender<Transaction>>,
+    streams:        Streams,
     auth_token:     Option<String>,
     tls_cert:       Option<String>,
     tls_key:        Option<String>,
@@ -152,8 +195,9 @@ pub fn start_grpc_server(
         eprintln!("[grpc] listening on {addr}");
 
         let svc = ColibriGrpcService {
-            entry_sender,
-            tx_sender,
+            entry_sender:  streams.entries,
+            tx_sender:     streams.txs,
+            footer_sender: streams.footers,
             auth_token: auth_token.map(Arc::new),
             requested_from,
         };
@@ -195,3 +239,4 @@ pub fn start_grpc_server(
 
 pub use shredstream::Entry as ProtoEntry;
 pub use shredstream::Transaction as ProtoTransaction;
+pub use shredstream::Footer as ProtoFooter;
