@@ -622,6 +622,16 @@ fn main() -> Result<()> {
         None       => eprintln!("[colibri] advertise ip:  {}", cfg.ip),
     }
     eprintln!("[colibri] rpc:           {}", cfg.rpc_url);
+    eprintln!("[colibri] entrypoints:   {}", cfg.entrypoints.len());
+    if cfg.entrypoints.len() < 3 {
+        // --entrypoint REPLACES the list. One or two is the stall mode: a
+        // single slow entrypoint leaves gossip at peers=0 indefinitely.
+        eprintln!(
+            "[colibri] WARNING: only {} entrypoint(s) — one dead entrypoint stalls gossip \
+             (peers=0). Pass several, or omit --entrypoint for the built-in mainnet five.",
+            cfg.entrypoints.len()
+        );
+    }
     eprintln!("[colibri] grpc port:     {}", cfg.grpc_port);
     eprintln!("[colibri] auth:          {}", if cfg.auth_token.is_some() { "token required" } else { "open (no auth)" });
     eprintln!("[colibri] tier1-fanout:  {}", cfg.tier1_fanout);
