@@ -37,7 +37,6 @@ use {
     std::{
         collections::{HashMap, HashSet},
         env,
-        io::{Read as IoRead, Write as IoWrite},
         net::{IpAddr, SocketAddr},
         str::FromStr,
         sync::{
@@ -51,13 +50,29 @@ use {
 };
 
 const TURBINE_FANOUT: usize = 200;
+
+/// Used when neither the config file nor the command line names any. One
+/// dead entrypoint stalls gossip, so the default is all five, not one.
+const MAINNET_ENTRYPOINTS: [&str; 5] = [
+    "entrypoint.mainnet-beta.solana.com:8001",
+    "entrypoint2.mainnet-beta.solana.com:8001",
+    "entrypoint3.mainnet-beta.solana.com:8001",
+    "entrypoint4.mainnet-beta.solana.com:8001",
+    "entrypoint5.mainnet-beta.solana.com:8001",
+];
+const DEFAULT_CONFIG_PATH: &str = "colibri.json";
 const TIER1_REFRESH_SECS: u64 = 600;
 
 fn print_usage() {
     eprintln!("Usage: colibri [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --ip <IP>               Public IP to advertise in gossip (required)");
+    eprintln!("  --config <PATH>         JSON config; keys are the flags below without dashes,");
+    eprintln!("                          underscores for hyphens, `entrypoints` as an array.");
+    eprintln!("                          ./colibri.json is loaded automatically if present.");
+    eprintln!("                          Command-line flags override the file.");
+    eprintln!("  --ip <IP>               Public IP to advertise in gossip");
+    eprintln!("                          (required unless --stun is given)");
     eprintln!("  --port <PORT>           Gossip UDP port (default: 8000)");
     eprintln!("  --tvu-port <PORT>       TVU port where shreds arrive (default: 8200)");
     eprintln!("  --repair-port <PORT>    UDP port for repair responses (default: 8210)");
@@ -65,7 +80,8 @@ fn print_usage() {
     eprintln!("                          external NAT mapping instead of --ip:port.");
     eprintln!("                          Needed behind a port-rewriting NAT; omit");
     eprintln!("                          on a host with a real public IP.");
-    eprintln!("  --entrypoint <ADDR>     Solana entrypoint (repeatable — pass several)");
+    eprintln!("  --entrypoint <ADDR>     Solana entrypoint (repeatable). Default: the five");
+    eprintln!("                          mainnet-beta entrypoints; flags replace the file's list.");
     eprintln!("  --shred-version <VER>   Shred version (default: fetched from entrypoint)");
     eprintln!("  --rpc <URL>             RPC endpoint for stake + leader-schedule data");
     eprintln!("  --tier1-fanout <N>      Stake table size for repair peer scoring (default: 200)");
@@ -74,9 +90,9 @@ fn print_usage() {
     eprintln!("  --tls-cert <PATH>       TLS certificate PEM (enables TLS when combined with --tls-key)");
     eprintln!("  --tls-key <PATH>        TLS private key PEM");
     eprintln!("  --keypair <PATH>        Path to keypair JSON file (load or auto-create for stable gossip identity)");
-    eprintln!("  --depth <N>             Backfill depth from tip when no consumer reports from-slot (default: 6000)");
+    eprintln!("  --depth <N>             Backfill depth from tip when no consumer reports from-slot (default: 500)");
     eprintln!("  --window <N>            Slots repaired in parallel (default: 64)");
-    eprintln!("  --top-peers <N>         Distinct peers repair requests are spread across (default: 64)");
+    eprintln!("  --top-peers <N>         Distinct peers repair requests are spread across (default: 128)");
     eprintln!("  --oracle-rpc <URL>      Enable RPC oracle cross-check (samples completed slots via getBlock)");
     eprintln!("  --help                  Print this help");
 }
@@ -118,14 +134,61 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
     let mut keypair_path: Option<String> = None;
-    let mut depth: u64 = 6000;
+    let mut depth: u64 = 500;
     let mut window: usize = 64;
-    let mut top_peers: usize = 64;
+    let mut top_peers: usize = 128;
     let mut oracle_rpc: Option<String> = None;
+
+    // Config file first, so every flag below simply overrides it. `--config`
+    // names it explicitly; otherwise ./colibri.json is used when it exists.
+    let config_path = args.iter().position(|a| a == "--config")
+        .map(|i| args.get(i + 1).cloned().ok_or("--config needs a path"))
+        .transpose()?
+        .or_else(|| std::path::Path::new(DEFAULT_CONFIG_PATH).exists().then(|| DEFAULT_CONFIG_PATH.to_string()));
+    let mut file_entrypoints: Vec<String> = Vec::new();
+    if let Some(path) = &config_path {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("config {path}: {e}"))?;
+        let v: Value = serde_json::from_str(&text).map_err(|e| format!("config {path}: {e}"))?;
+        let obj = v.as_object().ok_or_else(|| format!("config {path}: top level must be an object"))?;
+        let str_ = |k: &str| obj.get(k).map(|x| x.as_str().map(str::to_string).ok_or(format!("config {path}: `{k}` must be a string"))).transpose();
+        let num = |k: &str| obj.get(k).map(|x| x.as_u64().ok_or(format!("config {path}: `{k}` must be an integer"))).transpose();
+        for key in obj.keys() {
+            const KNOWN: [&str; 18] = ["ip","port","tvu_port","repair_port","stun","entrypoints","shred_version","rpc",
+                "tier1_fanout","grpc_port","auth_token","tls_cert","tls_key","keypair","depth","window","top_peers","oracle_rpc"];
+            if !KNOWN.contains(&key.as_str()) {
+                return Err(format!("config {path}: unknown key `{key}` (known: {})", KNOWN.join(", ")).into());
+            }
+        }
+        if let Some(x) = str_("ip")?            { ip = Some(x.parse()?); }
+        if let Some(x) = num("port")?           { port = x.try_into()?; }
+        if let Some(x) = num("tvu_port")?       { tvu_port = x.try_into()?; }
+        if let Some(x) = num("repair_port")?    { repair_port = x.try_into()?; }
+        if let Some(x) = str_("stun")?          { stun_server = Some(x); }
+        if let Some(x) = num("shred_version")?  { shred_version = Some(x.try_into()?); }
+        if let Some(x) = str_("rpc")?           { rpc_url = x; }
+        if let Some(x) = num("tier1_fanout")?   { tier1_fanout = x as usize; }
+        if let Some(x) = num("grpc_port")?      { grpc_port = x.try_into()?; }
+        if let Some(x) = str_("auth_token")?    { auth_token = Some(x); }
+        if let Some(x) = str_("tls_cert")?      { tls_cert = Some(x); }
+        if let Some(x) = str_("tls_key")?       { tls_key = Some(x); }
+        if let Some(x) = str_("keypair")?       { keypair_path = Some(x); }
+        if let Some(x) = num("depth")?          { depth = x; }
+        if let Some(x) = num("window")?         { window = x as usize; }
+        if let Some(x) = num("top_peers")?      { top_peers = x as usize; }
+        if let Some(x) = str_("oracle_rpc")?    { oracle_rpc = Some(x); }
+        if let Some(arr) = obj.get("entrypoints") {
+            let arr = arr.as_array().ok_or_else(|| format!("config {path}: `entrypoints` must be an array"))?;
+            for e in arr {
+                file_entrypoints.push(e.as_str().ok_or_else(|| format!("config {path}: entrypoints must be strings"))?.to_string());
+            }
+        }
+        eprintln!("[colibri] config:        {path}");
+    }
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--config"        => { i += 1; } // consumed above
             "--ip"            => { i += 1; ip            = Some(args[i].parse()?); }
             "--port"          => { i += 1; port          = args[i].parse()?; }
             "--tvu-port"      => { i += 1; tvu_port      = args[i].parse()?; }
@@ -154,7 +217,20 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
         i += 1;
     }
 
-    let ip = ip.ok_or("--ip <PUBLIC_IP> is required")?;
+    if entrypoints.is_empty() {
+        entrypoints = file_entrypoints;
+    }
+    if entrypoints.is_empty() {
+        entrypoints = MAINNET_ENTRYPOINTS.iter().map(|s| s.to_string()).collect();
+    }
+
+    // STUN derives the real advertised IP from the socket mapping itself, so
+    // --ip is only a required fallback when there's no STUN server to ask.
+    let ip = match ip {
+        Some(ip) => ip,
+        None if stun_server.is_some() => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        None => return Err("--ip <PUBLIC_IP> is required (or pass --stun)".into()),
+    };
     Ok(Config {
         ip, port, tvu_port, repair_port, stun_server, entrypoints, shred_version,
         rpc_url, tier1_fanout, grpc_port, auth_token, tls_cert, tls_key,
@@ -162,31 +238,22 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
     })
 }
 
+/// One JSON-RPC POST; `None` on any transport or HTTP error. Plain and TLS
+/// URLs both work — the previous hand-rolled HTTP/1.0 over a raw TcpStream
+/// silently failed on `https://`, which read as "RPC down" in the logs.
 pub(crate) fn rpc_post(url: &str, body: &str) -> Option<String> {
-    let without_scheme = url.strip_prefix("http://").unwrap_or(url);
-    let (host_port, path) = match without_scheme.find('/') {
-        Some(i) => (&without_scheme[..i], &without_scheme[i..]),
-        None    => (without_scheme, "/"),
-    };
-    let (host, port): (&str, u16) = match host_port.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse().unwrap_or(80)),
-        None         => (host_port, 80),
-    };
-
-    let req = format!(
-        "POST {path} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-
-    let mut stream = std::net::TcpStream::connect((host, port)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(20))).ok()?;
-    stream.write_all(req.as_bytes()).ok()?;
-
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).ok()?;
-    let text = String::from_utf8_lossy(&raw);
-    let body_start = text.find("\r\n\r\n")? + 4;
-    Some(text[body_start..].to_string())
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(20)))
+        .build()
+        .into();
+    agent
+        .post(url)
+        .header("Content-Type", "application/json")
+        .send(body)
+        .ok()?
+        .body_mut()
+        .read_to_string()
+        .ok()
 }
 
 /// Fetch the top-`fanout` validators by activated stake: (stake, node pubkey).
@@ -550,7 +617,10 @@ fn main() -> Result<()> {
         }
     });
     eprintln!("[colibri] pubkey:        {}", keypair.pubkey());
-    eprintln!("[colibri] advertise ip:  {}", cfg.ip);
+    match &cfg.stun_server {
+        Some(stun) => eprintln!("[colibri] advertise ip:  discovered via STUN ({stun}) per socket at bind"),
+        None       => eprintln!("[colibri] advertise ip:  {}", cfg.ip),
+    }
     eprintln!("[colibri] rpc:           {}", cfg.rpc_url);
     eprintln!("[colibri] grpc port:     {}", cfg.grpc_port);
     eprintln!("[colibri] auth:          {}", if cfg.auth_token.is_some() { "token required" } else { "open (no auth)" });

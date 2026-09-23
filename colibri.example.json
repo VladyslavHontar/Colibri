@@ -1,0 +1,15 @@
+{
+  "stun": "stun.l.google.com:19302",
+  "rpc": "https://api.mainnet-beta.solana.com",
+  "depth": 500,
+  "window": 32,
+  "grpc_port": 8888,
+  "keypair": "colibri-identity.json",
+  "entrypoints": [
+    "entrypoint.mainnet-beta.solana.com:8001",
+    "entrypoint2.mainnet-beta.solana.com:8001",
+    "entrypoint3.mainnet-beta.solana.com:8001",
+    "entrypoint4.mainnet-beta.solana.com:8001",
+    "entrypoint5.mainnet-beta.solana.com:8001"
+  ]
+}
