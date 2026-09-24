@@ -31,7 +31,7 @@ Turbine sends shreds to the address Colibri **advertises** in gossip. Pick the o
 
 With `stun` Colibri asks the STUN server what address it sees, **from the very socket that will receive**, and advertises that mapping for gossip and TVU. A keep-alive re-probes every 20 s so the router never expires the TVU mapping (TVU never transmits on its own). Without it a NATed node joins gossip cleanly, shows up in peer tables, and then receives nothing.
 
-Limits: STUN only helps behind a full-cone NAT (endpoint-independent mapping and filtering). An address-restricted NAT passes the probe and still drops turbine. If gossip peers appear but no shreds arrive, that is the first thing to check. `ip` and `stun` are mutually exclusive; `ip` wins if both are given.
+Limits: STUN only helps behind a full-cone NAT (endpoint-independent mapping and filtering). An address-restricted NAT passes the probe and still drops turbine. If gossip peers appear but no shreds arrive, that is the first thing to check. When both are set, `stun` wins: the probed address is advertised and `ip` is ignored.
 
 ## Configuration
 
