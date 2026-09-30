@@ -1,4 +1,4 @@
-FROM rust:latest AS builder
+FROM rust:bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     libclang-dev cmake pkg-config libssl-dev git protobuf-compiler \
