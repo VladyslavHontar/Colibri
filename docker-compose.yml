@@ -20,10 +20,7 @@ services:
       # - SOLANA_RPC=https://api.mainnet-beta.solana.com
       # - DEPTH=500
     volumes:
-      - colibri-data:/data           # persists the gossip identity + the auth token
-
-volumes:
-  colibri-data:
+      - ./colibri-data:/data           # persists the gossip identity + the auth token
 
 secrets:
   github_token:
