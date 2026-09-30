@@ -14,9 +14,16 @@ COPY Cargo.toml Cargo.lock ./
 COPY colibri ./colibri
 COPY shred-net ./shred-net
 
+# Fetch the private deshredder dep with the token exposed ONLY through a git
+# credential helper that reads the tmpfs-mounted secret at fetch time. The
+# stored config holds the helper (a path reference), never the token value, so
+# the secret never lands in a build layer. Cargo uses the git CLI so the helper
+# is honoured.
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 RUN --mount=type=secret,id=github_token \
-    sh -c 'git config --global url."https://x-access-token:$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/" \
-        && cargo build --release -p colibri --jobs 4'
+    git config --global credential.helper \
+        '!f() { echo username=x-access-token; echo "password=$(cat /run/secrets/github_token)"; }; f' \
+    && cargo build --release -p colibri --jobs 4
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y libssl3 ca-certificates openssl \

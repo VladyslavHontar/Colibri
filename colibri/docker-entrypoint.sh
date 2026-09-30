@@ -11,14 +11,18 @@ mkdir -p "$DATA"
 
 # ── Auth token ────────────────────────────────────────────────────────────────
 # Priority: AUTH_TOKEN env  >  persisted token  >  freshly generated one.
+# The full token is printed only when freshly generated; on restarts it is
+# masked (the full value stays in the 0600 file on the volume).
 if [ -n "$AUTH_TOKEN" ]; then
-    TOKEN="$AUTH_TOKEN"
+    TOKEN="$AUTH_TOKEN"; FRESH=0
 elif [ -f "$DATA/auth_token" ]; then
-    TOKEN="$(cat "$DATA/auth_token")"
+    TOKEN="$(cat "$DATA/auth_token")"; FRESH=0
 else
     TOKEN="$(openssl rand -hex 32)"
     printf '%s' "$TOKEN" > "$DATA/auth_token"
+    FRESH=1
 fi
+chmod 600 "$DATA/auth_token" 2>/dev/null || true
 
 # ── Gossip advertisement ──────────────────────────────────────────────────────
 # PUBLIC_IP set -> advertise it directly; otherwise STUN discovers the NAT mapping.
@@ -30,7 +34,12 @@ fi
 
 echo "================================ COLIBRI ================================"
 echo "  gRPC endpoint : http://<this-host>:8888   (SubscribeEntries/Footers/Transactions)"
-echo "  auth token    : $TOKEN"
+if [ "$FRESH" = 1 ]; then
+    echo "  auth token    : $TOKEN"
+    echo "                  ^ generated now — save it; on restarts it is masked."
+else
+    echo "  auth token    : ${TOKEN%${TOKEN#????????}}…  (full value in the volume: /data/auth_token)"
+fi
 echo "  subscribers send header:  authorization: Bearer <token>"
 echo "  advertise     : ${PUBLIC_IP:-STUN ${STUN_SERVER:-stun.l.google.com:19302}}"
 echo "========================================================================"
