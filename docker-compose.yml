@@ -1,10 +1,8 @@
 services:
   colibri:
     build:
-      context: .                     # the Colibri repo itself (Deshreder is a git dep)
+      context: .                     # the Colibri repo itself (Deshreder is a public git dep)
       dockerfile: colibri/Dockerfile
-      secrets:
-        - github_token               # used only at build time to fetch the private dep
     platform: linux/amd64
     restart: unless-stopped
     ports:
@@ -21,7 +19,3 @@ services:
       # - DEPTH=500
     volumes:
       - ./colibri-data:/data           # persists the gossip identity + the auth token
-
-secrets:
-  github_token:
-    environment: GITHUB_TOKEN        # read from .env / the shell at build time
