@@ -1,22 +1,30 @@
-version: "3.9"
 services:
   colibri:
     build:
-      context: ../..  # /Users/newuser/RustroverProjects/ — contains both Colibri/ and Deshreder/
-      dockerfile: Colibri/colibri/Dockerfile
+      context: .                     # the Colibri repo itself (Deshreder is a git dep)
+      dockerfile: colibri/Dockerfile
+      secrets:
+        - github_token               # used only at build time to fetch the private dep
     platform: linux/amd64
+    restart: unless-stopped
     ports:
-      - "8000:8000/udp"   # gossip
-      - "8200:8200/udp"   # TVU — validators send shreds here
-      - "8210:8210/udp"   # repair responses (must be open in cloud firewall)
-      - "8888:8888"       # gRPC SubscribeEntries
+      - "8000:8000/udp"              # gossip
+      - "8200:8200/udp"              # TVU — validators send shreds here
+      - "8210:8210/udp"              # repair responses (open in the firewall)
+      - "8888:8888"                  # gRPC (SubscribeEntries / Footers / Transactions)
     environment:
       - RUST_LOG=info
-    restart: unless-stopped
-    command: >
-      ./colibri
-        --ip ${GOSSIP_IP}
-        --entrypoint entrypoint.mainnet-beta.solana.com:8001
-        --entrypoint entrypoint2.mainnet-beta.solana.com:8001
-        --entrypoint entrypoint3.mainnet-beta.solana.com:8001
-        --grpc-port 8888
+      # Everything below is OPTIONAL — sane defaults are baked in.
+      # - PUBLIC_IP=203.0.113.10     # host has a public IP -> advertise it, skip STUN
+      # - AUTH_TOKEN=                # pin the token; empty -> auto-generated + printed
+      # - SOLANA_RPC=https://api.mainnet-beta.solana.com
+      # - DEPTH=500
+    volumes:
+      - colibri-data:/data           # persists the gossip identity + the auth token
+
+volumes:
+  colibri-data:
+
+secrets:
+  github_token:
+    environment: GITHUB_TOKEN        # read from .env / the shell at build time
