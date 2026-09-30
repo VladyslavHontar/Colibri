@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 FROM rust:latest AS builder
 
 RUN apt-get update && apt-get install -y \
@@ -6,25 +7,22 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
-# Build context is the parent directory (/Users/newuser/RustroverProjects/)
-# which contains both Colibri/ and Deshreder/ repos.
+# Colibri's own workspace only. `deshredder` is a PRIVATE git dependency,
+# fetched during the build using the `github_token` BuildKit secret — no local
+# Deshreder checkout, and the token never lands in an image layer.
+COPY Cargo.toml Cargo.lock ./
+COPY colibri ./colibri
+COPY shred-net ./shred-net
 
-# Copy the Deshreder library (deshredder dep, built from the local checkout)
-COPY Deshreder ./Deshreder
-
-# Copy workspace files from Colibri/
-COPY Colibri/Cargo.toml Colibri/Cargo.lock ./
-COPY Colibri/colibri ./colibri
-COPY Colibri/shred-net ./shred-net
-
-# Build deshredder from the local copy instead of fetching the git dep
-RUN sed -i 's|deshredder = { git = ".*" }|deshredder = { path = "../Deshreder" }|' colibri/Cargo.toml
-
-RUN cargo build --release -p colibri --jobs 4
+RUN --mount=type=secret,id=github_token \
+    sh -c 'git config --global url."https://x-access-token:$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/" \
+        && cargo build --release -p colibri --jobs 4'
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y libssl3 ca-certificates \
+RUN apt-get update && apt-get install -y libssl3 ca-certificates openssl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /build/target/release/colibri .
-CMD ["./colibri"]
+COPY colibri/docker-entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
