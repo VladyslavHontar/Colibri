@@ -3,7 +3,8 @@ services:
     build:
       context: .                     # the Colibri repo itself (Deshreder is a public git dep)
       dockerfile: colibri/Dockerfile
-    platform: linux/amd64
+    # No platform pin: builds and runs native for the host arch (amd64 or arm64).
+    # Force one only if you need it, e.g. `platform: linux/amd64`.
     restart: unless-stopped
     ports:
       - "8000:8000/udp"              # gossip
