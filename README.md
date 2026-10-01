@@ -4,7 +4,25 @@ Solana shred-to-transaction node. Joins gossip as a plain (non-staked) peer, rec
 
 ## Quick start
 
-Prerequisites: Rust stable, `protobuf-compiler`, `cmake`, `libclang-dev`, `libssl-dev` (Linux; on macOS `brew install protobuf cmake llvm openssl`).
+The easiest way is Docker. Nothing to configure:
+
+```bash
+docker compose up
+```
+
+That builds the image, joins mainnet gossip (the public address is found automatically via STUN) and serves gRPC on `:8888`. The auth token is generated on first start and printed in the log; it is kept in `./colibri-data`, so it survives restarts.
+
+Open UDP `8000`, `8200`, `8210` and TCP `8888` inbound. Check it works with the bundled subscriber:
+
+```bash
+cargo run -p colibri --example subscribe -- --url http://127.0.0.1:8888
+```
+
+Optional settings go in the `environment:` block of `docker-compose.yml`: `PUBLIC_IP` (host has a real public IP, skips STUN), `AUTH_TOKEN`, `SOLANA_RPC`, `DEPTH`.
+
+### Without Docker
+
+Prerequisites: Rust stable, `protobuf-compiler`, `cmake`, `libclang-dev`, `libssl-dev` (on macOS `brew install protobuf cmake llvm openssl`).
 
 ```bash
 cargo build --release -p colibri
@@ -12,13 +30,7 @@ cp colibri.example.json colibri.json      # edit if needed
 ./target/release/colibri                  # ./colibri.json is picked up automatically
 ```
 
-The example config uses the five mainnet-beta entrypoints, a public STUN server and a 500-slot backfill. That is enough for a machine behind a home or cloud NAT. Open UDP `8000`, `8200`, `8210` and TCP `8888` inbound.
-
-Check it works with the bundled subscriber:
-
-```bash
-cargo run -p colibri --example subscribe -- --url http://127.0.0.1:8888
-```
+The example config uses the five mainnet-beta entrypoints, a public STUN server and a 500-slot backfill, which is enough behind a home or cloud NAT.
 
 ## Where does my node live?
 
@@ -76,17 +88,6 @@ Proto: [`colibri/protos/shredstream.proto`](colibri/protos/shredstream.proto). T
 3. **Assemble** feeds turbine and repair shreds into one in-memory deshredder (Reed-Solomon recovery). Entry batches stream out as soon as they are contiguous.
 4. **Repair** asks the deshredder what is missing and drives the repair protocol until every targeted slot is complete, marking never-produced slots as skipped.
 5. **gRPC** fans the result out to subscribers.
-
-## Docker
-
-The build context is the directory that holds both `Colibri/` and `Deshreder/`:
-
-```bash
-# from the parent of Colibri/ and Deshreder/
-GOSSIP_IP=203.0.113.10 docker compose -f Colibri/docker-compose.yml up --build
-```
-
-Docker Compose still passes `--ip`; on a NATed host edit the `command` to use `--stun stun.l.google.com:19302` instead.
 
 ## Coverage
 
