@@ -78,21 +78,20 @@ impl ShredstreamProxy for ColibriGrpcService {
         tokio::spawn(async move {
             loop {
                 match bcast.recv().await {
+                    // Wait for a slow subscriber: the backlog flushed after a
+                    // catch-up overran 256 queued messages and cut a healthy
+                    // consumer off (2026-10-19). Falling behind the broadcast
+                    // buffer still ends the stream, with a data-loss error below.
                     Ok(entry) => {
-                        match tx.try_send(Ok(entry)) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                eprintln!("[grpc] entries subscriber too slow, disconnecting");
-                                break;
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                        if tx.send(Ok(entry)).await.is_err() {
+                            break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         eprintln!("[grpc] entries subscriber lagged by {n}, disconnecting");
-                        let _ = tx.try_send(Err(Status::data_loss(
+                        let _ = tx.send(Err(Status::data_loss(
                             format!("stream lagged: {n} entries dropped"),
-                        )));
+                        ))).await;
                         break;
                     }
                     Err(_) => break,
@@ -116,20 +115,15 @@ impl ShredstreamProxy for ColibriGrpcService {
             loop {
                 match bcast.recv().await {
                     Ok(transaction) => {
-                        match tx.try_send(Ok(transaction)) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                eprintln!("[grpc] txs subscriber too slow, disconnecting");
-                                break;
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                        if tx.send(Ok(transaction)).await.is_err() {
+                            break;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         eprintln!("[grpc] txs subscriber lagged by {n}, disconnecting");
-                        let _ = tx.try_send(Err(Status::data_loss(
+                        let _ = tx.send(Err(Status::data_loss(
                             format!("stream lagged: {n} transactions dropped"),
-                        )));
+                        ))).await;
                         break;
                     }
                     Err(_) => break,
@@ -152,17 +146,14 @@ impl ShredstreamProxy for ColibriGrpcService {
         tokio::spawn(async move {
             loop {
                 match bcast.recv().await {
-                    Ok(footer) => match tx.try_send(Ok(footer)) {
-                        Ok(()) => {}
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            eprintln!("[grpc] footers subscriber too slow, disconnecting");
+                    Ok(footer) => {
+                        if tx.send(Ok(footer)).await.is_err() {
                             break;
                         }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
-                    },
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         eprintln!("[grpc] footers subscriber lagged by {n}, disconnecting");
-                        let _ = tx.try_send(Err(Status::data_loss(format!("stream lagged: {n} footers dropped"))));
+                        let _ = tx.send(Err(Status::data_loss(format!("stream lagged: {n} footers dropped")))).await;
                         break;
                     }
                     Err(_) => break,
