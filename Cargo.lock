@@ -5982,7 +5982,6 @@ dependencies = [
 [[package]]
 name = "solana-gossip"
 version = "4.3.0"
-source = "git+https://github.com/anza-xyz/agave.git?tag=v4.3.0#825efd18292aff6ffcf9daa0f7612f21b3531a72"
 dependencies = [
  "agave-logger",
  "agave-random",

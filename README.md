@@ -43,6 +43,8 @@ Turbine sends shreds to the address Colibri **advertises** in gossip. Pick the o
 
 With `stun` Colibri asks the STUN server what address it sees, **from the very socket that will receive**, and advertises that mapping for gossip and TVU. A keep-alive re-probes every 20 s so the router never expires the TVU mapping (TVU never transmits on its own). Without it a NATed node joins gossip cleanly, shows up in peer tables, and then receives nothing.
 
+On a home connection, also set `"repair_rate": 500` and a small `depth` and `window`: unlimited repair sends tens of thousands of requests a second. Gossip is already trimmed for it: the vendored `solana-gossip` (see `vendor/solana-gossip/PATCH.md`) pushes only this node's own values instead of relaying the cluster's, which measured ~12,600 packets/s out.
+
 Limits: STUN only helps behind a full-cone NAT (endpoint-independent mapping and filtering). An address-restricted NAT passes the probe and still drops turbine. If gossip peers appear but no shreds arrive, that is the first thing to check. When both are set, `stun` wins: the probed address is advertised and `ip` is ignored.
 
 ## Configuration
@@ -66,6 +68,7 @@ Limits: STUN only helps behind a full-cone NAT (endpoint-independent mapping and
 | `depth` / `--depth` | `500` | Backfill depth from tip when no subscriber sends `from-slot` |
 | `window` / `--window` | `64` | Slots repaired in parallel |
 | `top_peers` / `--top-peers` | `128` | Distinct peers repair requests are spread across |
+| `repair_rate` / `--repair-rate` | `0` | Most repair requests sent per second; `0` is no limit. A home link wants a few hundred |
 | `tier1_fanout` / `--tier1-fanout` | `200` | Stake table size for repair peer scoring |
 | `oracle_rpc` / `--oracle-rpc` | — | Cross-check completed slots against `getBlock` (debug) |
 

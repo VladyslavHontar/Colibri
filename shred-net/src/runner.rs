@@ -90,6 +90,10 @@ pub struct ShredNetConfig {
     /// rate-limits us independently, so aggregate serve-rate scales ~linearly
     /// with peer count (until the local insert path saturates).
     pub top_peers: usize,
+    /// Most repair requests sent per second; 0 sends as fast as the window
+    /// asks. A home uplink cannot carry the unlimited rate (15-28k/s measured
+    /// at window 32).
+    pub repair_rate: u64,
 }
 
 impl Default for ShredNetConfig {
@@ -107,6 +111,7 @@ impl Default for ShredNetConfig {
             // 128, not 64: measured 2026-09-23, response yield per request
             // 14.5% → 27.9% and completed slots 235 → 365 in 170 s.
             top_peers: 128,
+            repair_rate: 0,
         }
     }
 }
@@ -475,6 +480,7 @@ fn spawn_dispatch(
     let target_window = cfg.target_window.max(1);
     let top_peers = cfg.top_peers.max(1);
     let keep_window = cfg.keep_window;
+    let repair_rate = (cfg.repair_rate > 0).then_some(cfg.repair_rate);
 
     std::thread::spawn(move || {
         let mut driver: HashMap<u64, DriverState> = HashMap::new();
@@ -484,6 +490,8 @@ fn spawn_dispatch(
         let mut nonce: u32 = 0xdead_beef;
         let mut last_purge = Instant::now();
         let mut last_diag = Instant::now();
+        // Requests still allowed this second; `None` is no limit.
+        let (mut budget, mut budget_since) = (repair_rate, Instant::now());
 
         loop {
             if exit.load(Ordering::Relaxed) {
@@ -511,6 +519,10 @@ fn spawn_dispatch(
             let now_ms = now_millis();
             let stake_map = stakes.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let peers = gossip::repair_peers(&cluster_info, &stake_map, now_ms, top_peers);
+
+            if budget_since.elapsed() >= Duration::from_secs(1) {
+                (budget, budget_since) = (repair_rate, Instant::now());
+            }
 
             // ── per-slot repair dispatch ──
             if !peers.is_empty() {
@@ -565,6 +577,7 @@ fn spawn_dispatch(
                             }
                         }
                         RepairAction::Wait => {}
+                        RepairAction::ProbeHighest if !afford(&mut budget, peers.len()) => {}
                         RepairAction::ProbeHighest => {
                             state.last_repair = Instant::now();
                             state.repair_rounds += 1;
@@ -575,6 +588,7 @@ fn spawn_dispatch(
                                 nonce = nonce.wrapping_add(1);
                             }
                         }
+                        RepairAction::RequestOrphan if !afford(&mut budget, peers.len()) => {}
                         RepairAction::RequestOrphan => {
                             state.last_repair = Instant::now();
                             state.repair_rounds += 1;
@@ -584,6 +598,7 @@ fn spawn_dispatch(
                                 nonce = nonce.wrapping_add(1);
                             }
                         }
+                        RepairAction::RequestWindows(ref batch) if !afford(&mut budget, batch.len()) => {}
                         RepairAction::RequestWindows(batch) => {
                             state.last_repair = Instant::now();
                             state.repair_rounds += 1;
@@ -688,6 +703,21 @@ fn spawn_dispatch(
     })
 }
 
+/// Takes `cost` requests out of what is left this second; false when nothing
+/// is, and the slot waits for a later round. `None` is no limit.
+// ponytail: a round that starts with budget left is sent whole, so a second
+// can overshoot by one round (at most top_peers or 128 requests).
+fn afford(budget: &mut Option<u64>, cost: usize) -> bool {
+    match budget {
+        None => true,
+        Some(0) => false,
+        Some(left) => {
+            *left = left.saturating_sub(cost as u64);
+            true
+        }
+    }
+}
+
 fn send_counted(sock: &UdpSocket, req: &[u8], addr: &SocketAddr, diag: &Diag) {
     match sock.send_to(req, addr) {
         Ok(_) => diag.reqs.fetch_add(1, Ordering::Relaxed),
@@ -714,4 +744,19 @@ fn set_recv_buffer(socket: &UdpSocket, bytes: usize) {
     }
     #[cfg(not(unix))]
     let _ = (socket, bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::afford;
+
+    #[test]
+    fn repair_waits_once_the_seconds_budget_is_spent() {
+        let mut budget = Some(100);
+        assert!(afford(&mut budget, 60));
+        assert!(afford(&mut budget, 60), "a round that starts within budget is sent whole");
+        assert_eq!(budget, Some(0));
+        assert!(!afford(&mut budget, 1), "then nothing until the next second");
+        assert!(afford(&mut None, 10_000), "no limit");
+    }
 }

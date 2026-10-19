@@ -90,6 +90,7 @@ fn print_usage() {
     eprintln!("  --depth <N>             Backfill depth from tip when no consumer reports from-slot (default: 500)");
     eprintln!("  --window <N>            Slots repaired in parallel (default: 64)");
     eprintln!("  --top-peers <N>         Distinct peers repair requests are spread across (default: 128)");
+    eprintln!("  --repair-rate <N>       Most repair requests sent per second, 0 = no limit (default: 0)");
     eprintln!("  --oracle-rpc <URL>      Enable RPC oracle cross-check (samples completed slots via getBlock)");
     eprintln!("  --help                  Print this help");
 }
@@ -112,6 +113,7 @@ struct Config {
     depth:         u64,
     window:        usize,
     top_peers:     usize,
+    repair_rate:   u64,
     oracle_rpc:    Option<String>,
 }
 
@@ -134,6 +136,7 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
     let mut depth: u64 = 500;
     let mut window: usize = 64;
     let mut top_peers: usize = 128;
+    let mut repair_rate: u64 = 0;
     let mut oracle_rpc: Option<String> = None;
 
     // Config file first, so every flag below simply overrides it. `--config`
@@ -150,8 +153,8 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
         let str_ = |k: &str| obj.get(k).map(|x| x.as_str().map(str::to_string).ok_or(format!("config {path}: `{k}` must be a string"))).transpose();
         let num = |k: &str| obj.get(k).map(|x| x.as_u64().ok_or(format!("config {path}: `{k}` must be an integer"))).transpose();
         for key in obj.keys() {
-            const KNOWN: [&str; 18] = ["ip","port","tvu_port","repair_port","stun","entrypoints","shred_version","rpc",
-                "tier1_fanout","grpc_port","auth_token","tls_cert","tls_key","keypair","depth","window","top_peers","oracle_rpc"];
+            const KNOWN: [&str; 19] = ["ip","port","tvu_port","repair_port","stun","entrypoints","shred_version","rpc",
+                "tier1_fanout","grpc_port","auth_token","tls_cert","tls_key","keypair","depth","window","top_peers","repair_rate","oracle_rpc"];
             if !KNOWN.contains(&key.as_str()) {
                 return Err(format!("config {path}: unknown key `{key}` (known: {})", KNOWN.join(", ")).into());
             }
@@ -172,6 +175,7 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
         if let Some(x) = num("depth")?          { depth = x; }
         if let Some(x) = num("window")?         { window = x as usize; }
         if let Some(x) = num("top_peers")?      { top_peers = x as usize; }
+        if let Some(x) = num("repair_rate")?    { repair_rate = x; }
         if let Some(x) = str_("oracle_rpc")?    { oracle_rpc = Some(x); }
         if let Some(arr) = obj.get("entrypoints") {
             let arr = arr.as_array().ok_or_else(|| format!("config {path}: `entrypoints` must be an array"))?;
@@ -203,6 +207,7 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
             "--depth"         => { i += 1; depth         = args[i].parse()?; }
             "--window"        => { i += 1; window        = args[i].parse()?; }
             "--top-peers"     => { i += 1; top_peers     = args[i].parse()?; }
+            "--repair-rate"   => { i += 1; repair_rate   = args[i].parse()?; }
             "--oracle-rpc"    => { i += 1; oracle_rpc    = Some(args[i].clone()); }
             "--help" | "-h"   => { print_usage(); std::process::exit(0); }
             other => {
@@ -231,7 +236,7 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
     Ok(Config {
         ip, port, tvu_port, repair_port, stun_server, entrypoints, shred_version,
         rpc_url, tier1_fanout, grpc_port, auth_token, tls_cert, tls_key,
-        keypair_path, depth, window, top_peers, oracle_rpc,
+        keypair_path, depth, window, top_peers, repair_rate, oracle_rpc,
     })
 }
 
@@ -591,7 +596,8 @@ fn main() -> Result<()> {
     eprintln!("[colibri] grpc port:     {}", cfg.grpc_port);
     eprintln!("[colibri] auth:          {}", if cfg.auth_token.is_some() { "token required" } else { "open (no auth)" });
     eprintln!("[colibri] tier1-fanout:  {}", cfg.tier1_fanout);
-    eprintln!("[colibri] depth:         {}  window: {}  top-peers: {}", cfg.depth, cfg.window, cfg.top_peers);
+    eprintln!("[colibri] depth:         {}  window: {}  top-peers: {}  repair-rate: {}", cfg.depth, cfg.window, cfg.top_peers,
+        if cfg.repair_rate == 0 { "no limit".to_string() } else { format!("{}/s", cfg.repair_rate) });
 
     if let (Some(cert_path), Some(key_path)) = (&cfg.tls_cert, &cfg.tls_key) {
         std::fs::metadata(cert_path)
@@ -798,6 +804,7 @@ fn main() -> Result<()> {
             keep_window:   cfg.depth.max(30_000) + 2_000,
             target_window: cfg.window,
             top_peers:     cfg.top_peers,
+            repair_rate:   cfg.repair_rate,
         },
         keypair,
         sink.clone(),
