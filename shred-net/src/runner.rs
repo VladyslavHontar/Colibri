@@ -515,8 +515,11 @@ fn spawn_dispatch(
         let mut nonce: u32 = 0xdead_beef;
         let mut last_purge = Instant::now();
         let mut last_diag = Instant::now();
-        // Requests still allowed this second; `None` is no limit.
-        let (mut budget, mut budget_since) = (repair_rate, Instant::now());
+        // Requests that may go out now; `None` is no limit. A token bucket
+        // holding at most BUDGET_BURST worth of the rate, not a budget reset
+        // once a second: that went out as one burst of up to 1,500 packets
+        // in the first ~10 ms, and the answers came back as a burst.
+        let (mut budget, mut budget_since) = (repair_rate.map(|_| 0), Instant::now());
 
         loop {
             if exit.load(Ordering::Relaxed) {
@@ -545,8 +548,11 @@ fn spawn_dispatch(
             let stake_map = stakes.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let peers = gossip::repair_peers(&cluster_info, &stake_map, now_ms, top_peers);
 
-            if budget_since.elapsed() >= Duration::from_secs(1) {
-                (budget, budget_since) = (repair_rate, Instant::now());
+            if let (Some(left), Some(rate)) = (budget.as_mut(), repair_rate) {
+                if let Some(add) = refill(rate, budget_since.elapsed()) {
+                    *left = (*left + add).min(rate * BUDGET_BURST.as_millis() as u64 / 1000);
+                    budget_since = Instant::now();
+                }
             }
 
             // ── per-slot repair dispatch ──
@@ -607,29 +613,40 @@ fn spawn_dispatch(
                             }
                         }
                         RepairAction::Wait => {}
-                        RepairAction::ProbeHighest if !afford(&mut budget, probe.len()) => {}
                         RepairAction::ProbeHighest => {
+                            let n = grant(&mut budget, probe.len());
+                            if n == 0 {
+                                continue;
+                            }
                             state.last_repair = Instant::now();
                             state.repair_rounds += 1;
                             state.highest_probed = true;
-                            for (pk, addr) in probe {
+                            for (pk, addr) in &probe[..n] {
                                 let req = wire::highest_window_index(&keypair, pk, slot, 0, nonce);
                                 send_counted(&repair_sock, &req, addr, &diag);
                                 nonce = nonce.wrapping_add(1);
                             }
                         }
-                        RepairAction::RequestOrphan if !afford(&mut budget, probe.len()) => {}
                         RepairAction::RequestOrphan => {
+                            let n = grant(&mut budget, probe.len());
+                            if n == 0 {
+                                continue;
+                            }
                             state.last_repair = Instant::now();
                             state.repair_rounds += 1;
-                            for (pk, addr) in probe {
+                            for (pk, addr) in &probe[..n] {
                                 let req = wire::orphan(&keypair, pk, slot, nonce);
                                 send_counted(&repair_sock, &req, addr, &diag);
                                 nonce = nonce.wrapping_add(1);
                             }
                         }
-                        RepairAction::RequestWindows(ref batch) if !afford(&mut budget, batch.len()) => {}
                         RepairAction::RequestWindows(batch) => {
+                            // The extra HighestWindowIndex below rides along
+                            // uncounted: at most one per slot round.
+                            let n = grant(&mut budget, batch.len());
+                            if n == 0 {
+                                continue;
+                            }
                             state.last_repair = Instant::now();
                             state.repair_rounds += 1;
                             // No per-index dedup beyond the 200 ms slot pace.
@@ -647,7 +664,7 @@ fn spawn_dispatch(
                             // ~Nx redundant and trips serve_repair's per-requester
                             // rate limit; unserved indices retry next round against
                             // a different peer.
-                            for (i, idx) in batch.iter().enumerate() {
+                            for (i, idx) in batch[..n].iter().enumerate() {
                                 let (pk, addr) =
                                     &peers[(i + state.repair_rounds as usize) % peers.len()];
                                 let req = wire::window_index(&keypair, pk, slot, *idx, nonce);
@@ -744,17 +761,25 @@ fn spawn_dispatch(
     })
 }
 
-/// Takes `cost` requests out of what is left this second; false when nothing
-/// is, and the slot waits for a later round. `None` is no limit.
-// ponytail: a round that starts with budget left is sent whole, so a second
-// can overshoot by one round (at most top_peers or 128 requests).
-fn afford(budget: &mut Option<u64>, cost: usize) -> bool {
+/// Most repair requests that may leave back to back, as time at `repair_rate`.
+const BUDGET_BURST: Duration = Duration::from_millis(50);
+
+/// Whole requests earned at `rate`/s over `elapsed`; `None` below one, so the
+/// fraction keeps accruing instead of being dropped.
+fn refill(rate: u64, elapsed: Duration) -> Option<u64> {
+    let add = (rate as u128 * elapsed.as_micros() / 1_000_000) as u64;
+    (add > 0).then_some(add)
+}
+
+/// How many of `want` requests fit in what is left this tick; the rest wait
+/// for the slot's next round. `None` is no limit.
+fn grant(budget: &mut Option<u64>, want: usize) -> usize {
     match budget {
-        None => true,
-        Some(0) => false,
+        None => want,
         Some(left) => {
-            *left = left.saturating_sub(cost as u64);
-            true
+            let n = want.min(*left as usize);
+            *left -= n as u64;
+            n
         }
     }
 }
@@ -789,7 +814,16 @@ fn set_recv_buffer(socket: &UdpSocket, bytes: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{afford, DriverState};
+    use {
+        super::{grant, refill, DriverState},
+        std::time::Duration,
+    };
+
+    #[test]
+    fn refill_earns_whole_requests_only() {
+        assert_eq!(refill(1500, Duration::from_millis(10)), Some(15));
+        assert_eq!(refill(1500, Duration::from_micros(500)), None, "fraction keeps accruing");
+    }
 
     #[test]
     fn only_probed_attempts_count_toward_skipped() {
@@ -810,12 +844,11 @@ mod tests {
     }
 
     #[test]
-    fn repair_waits_once_the_seconds_budget_is_spent() {
+    fn repair_sends_what_fits_in_the_tick() {
         let mut budget = Some(100);
-        assert!(afford(&mut budget, 60));
-        assert!(afford(&mut budget, 60), "a round that starts within budget is sent whole");
-        assert_eq!(budget, Some(0));
-        assert!(!afford(&mut budget, 1), "then nothing until the next second");
-        assert!(afford(&mut None, 10_000), "no limit");
+        assert_eq!(grant(&mut budget, 60), 60);
+        assert_eq!(grant(&mut budget, 60), 40, "a round is cut to what is left");
+        assert_eq!(grant(&mut budget, 1), 0, "then nothing until the next tick");
+        assert_eq!(grant(&mut None, 10_000), 10_000, "no limit");
     }
 }
