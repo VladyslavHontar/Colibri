@@ -33,7 +33,7 @@ use {
     deshredder::Event,
     solana_keypair::Keypair,
     std::{
-        collections::{HashMap, HashSet, VecDeque},
+        collections::{BTreeMap, HashMap, HashSet, VecDeque},
         net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
@@ -149,6 +149,22 @@ impl DriverState {
             deadline: now + Duration::from_secs(30),
             retries: 0,
         }
+    }
+
+    /// The deadline passed. True when the slot should be reported skipped: it
+    /// still has no block data after `skip_after` attempts that each sent a
+    /// probe. Otherwise starts a fresh attempt. An attempt that never got a
+    /// probe out (the repair budget went to older slots) is not counted, or
+    /// a real block starved of budget would be reported as never produced.
+    fn on_deadline(&mut self, has_data: bool, skip_after: u32) -> bool {
+        if self.highest_probed {
+            self.retries += 1;
+        }
+        if !has_data && self.retries >= skip_after {
+            return true;
+        }
+        self.restart();
+        false
     }
 
     /// Start a fresh repair attempt after a blown deadline (re-probe from scratch).
@@ -473,7 +489,11 @@ fn spawn_dispatch(
     diag: Arc<Diag>,
 ) -> JoinHandle<()> {
     const ORPHAN_AFTER: u32 = 5;
-    // Deadlines with NO block data (last_index never learned) after this many
+    // Peers a HighestWindowIndex / Orphan goes to. One answer is enough, and
+    // a broadcast to every repair peer made top_peers 128 cost 128 requests
+    // per slot.
+    const PROBE_PEERS: usize = 16;
+    // Deadlines with NO block data (not one data shred) after this many probed
     // retries ⇒ the slot was skipped (leader never produced it). A real block
     // within the repair window yields its highest shred within seconds.
     const SKIP_AFTER_EMPTY_RETRIES: u32 = 2;
@@ -483,7 +503,12 @@ fn spawn_dispatch(
     let repair_rate = (cfg.repair_rate > 0).then_some(cfg.repair_rate);
 
     std::thread::spawn(move || {
-        let mut driver: HashMap<u64, DriverState> = HashMap::new();
+        // Ordered, so the repair budget goes oldest slot first. With a
+        // HashMap the iteration order was fixed per map, the same few slots
+        // took each second's budget and the rest never sent a request
+        // (rounds=0 after 5 deadlines, measured 2026-10-19), while an in-order
+        // consumer waits on the oldest.
+        let mut driver: BTreeMap<u64, DriverState> = BTreeMap::new();
         // Slots determined to have no block (skipped). Never re-admitted; the
         // consumer was told via on_slot_skipped.
         let mut skipped: HashSet<u64> = HashSet::new();
@@ -526,6 +551,7 @@ fn spawn_dispatch(
 
             // ── per-slot repair dispatch ──
             if !peers.is_empty() {
+                let probe = &peers[..peers.len().min(PROBE_PEERS)];
                 let mut done = Vec::new();             // completed → remove
                 let mut backstop_skip = Vec::new();    // no-block-after-retries → skip
                 let mut reveal: Vec<(u64, u64)> = Vec::new(); // (completed slot, its parent)
@@ -534,17 +560,21 @@ fn spawn_dispatch(
                         // Don't drop incomplete slots — a complete lane must reach
                         // 100% of producible slots. Retry forever; only conclude
                         // "skipped" when sustained tries yield NO block data.
-                        state.retries += 1;
-                        if reconstructor.last_index(slot).is_none()
-                            && state.retries >= SKIP_AFTER_EMPTY_RETRIES
-                        {
+                        // Any data shred means the block exists; last_index
+                        // alone is not enough, since turbine loses a slot's
+                        // last FEC set in about half the slots (2026-10-19:
+                        // a real block was reported skipped this way).
+                        let has_data = reconstructor.received(slot).is_some();
+                        if state.on_deadline(has_data, SKIP_AFTER_EMPTY_RETRIES) {
                             backstop_skip.push(slot);
-                        } else {
-                            state.restart();
                         }
                         continue;
                     }
-                    if state.last_repair.elapsed() < Duration::from_millis(50) {
+                    // 200 ms, not 50: under a repair_rate cap, re-asking the
+                    // oldest slot every 50 ms spent the whole budget on one
+                    // or two slots at a time (88.6% → 96.1% of slots in
+                    // 170 s at 1,500 req/s, 2026-10-19).
+                    if state.last_repair.elapsed() < Duration::from_millis(200) {
                         continue;
                     }
 
@@ -577,22 +607,22 @@ fn spawn_dispatch(
                             }
                         }
                         RepairAction::Wait => {}
-                        RepairAction::ProbeHighest if !afford(&mut budget, peers.len()) => {}
+                        RepairAction::ProbeHighest if !afford(&mut budget, probe.len()) => {}
                         RepairAction::ProbeHighest => {
                             state.last_repair = Instant::now();
                             state.repair_rounds += 1;
                             state.highest_probed = true;
-                            for (pk, addr) in &peers {
+                            for (pk, addr) in probe {
                                 let req = wire::highest_window_index(&keypair, pk, slot, 0, nonce);
                                 send_counted(&repair_sock, &req, addr, &diag);
                                 nonce = nonce.wrapping_add(1);
                             }
                         }
-                        RepairAction::RequestOrphan if !afford(&mut budget, peers.len()) => {}
+                        RepairAction::RequestOrphan if !afford(&mut budget, probe.len()) => {}
                         RepairAction::RequestOrphan => {
                             state.last_repair = Instant::now();
                             state.repair_rounds += 1;
-                            for (pk, addr) in &peers {
+                            for (pk, addr) in probe {
                                 let req = wire::orphan(&keypair, pk, slot, nonce);
                                 send_counted(&repair_sock, &req, addr, &diag);
                                 nonce = nonce.wrapping_add(1);
@@ -602,8 +632,9 @@ fn spawn_dispatch(
                         RepairAction::RequestWindows(batch) => {
                             state.last_repair = Instant::now();
                             state.repair_rounds += 1;
-                            // Deliberately NO outstanding-request dedup here.
-                            // Measured 2026-09-23 (170 s runs, depth 500):
+                            // No per-index dedup beyond the 200 ms slot pace.
+                            // Measured 2026-09-23 (170 s runs, depth 500, no
+                            // rate cap):
                             // serve_repair answers ~15% of an unstaked
                             // requester's requests at 64 peers regardless of
                             // rate, so agave's own 150 ms re-ask timeout
@@ -620,6 +651,15 @@ fn spawn_dispatch(
                                 let (pk, addr) =
                                     &peers[(i + state.repair_rounds as usize) % peers.len()];
                                 let req = wire::window_index(&keypair, pk, slot, *idx, nonce);
+                                send_counted(&repair_sock, &req, addr, &diag);
+                                nonce = nonce.wrapping_add(1);
+                            }
+                            // Length still unknown: keep asking one peer for
+                            // the highest shred, as agave's repair does.
+                            if last_index.is_none() {
+                                let (pk, addr) =
+                                    &peers[state.repair_rounds as usize % peers.len()];
+                                let req = wire::highest_window_index(&keypair, pk, slot, 0, nonce);
                                 send_counted(&repair_sock, &req, addr, &diag);
                                 nonce = nonce.wrapping_add(1);
                             }
@@ -663,8 +703,9 @@ fn spawn_dispatch(
             // ── diagnostics: which boundary is the bottleneck? ──
             if last_diag.elapsed() >= Duration::from_secs(10) {
                 let secs = last_diag.elapsed().as_secs_f64();
-                let (mut known, mut full) = (0usize, 0usize);
+                let (mut known, mut full, mut gaps) = (0usize, 0usize, 0usize);
                 for &slot in driver.keys() {
+                    gaps += reconstructor.missing_indices(slot, usize::MAX).len();
                     if reconstructor.last_index(slot).is_some() {
                         known += 1;
                     }
@@ -688,12 +729,12 @@ fn spawn_dispatch(
                 eprintln!(
                     "[shred-net] driver={} peers={} skipped={} | reqs/s={:.0} resp/s={:.0} inserted/s={:.0} \
                      chan_drop/s={:.0} send_err/s={:.0} pings/s={:.0} pongs/s={:.0} | \
-                     last_idx_known={}/{} full_in_map={} asm_slots={}",
+                     last_idx_known={}/{} full_in_map={} asm_slots={} missing={}",
                     driver.len(), peers.len(), skipped.len(),
                     take(&diag.reqs), take(&diag.resp), take(&diag.inserted),
                     take(&diag.chan_drop), take(&diag.send_err),
                     take(&diag.pings), take(&diag.pongs),
-                    known, driver.len(), full, reconstructor.active_slots(),
+                    known, driver.len(), full, reconstructor.active_slots(), gaps,
                 );
                 last_diag = Instant::now();
             }
@@ -748,7 +789,25 @@ fn set_recv_buffer(socket: &UdpSocket, bytes: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::afford;
+    use super::{afford, DriverState};
+
+    #[test]
+    fn only_probed_attempts_count_toward_skipped() {
+        let mut st = DriverState::new();
+        for _ in 0..5 {
+            assert!(!st.on_deadline(false, 2), "never probed: starved, not skipped");
+        }
+        st.highest_probed = true;
+        assert!(!st.on_deadline(false, 2));
+        assert!(!st.highest_probed, "a new attempt re-probes");
+        st.highest_probed = true;
+        assert!(st.on_deadline(false, 2), "two probed attempts, no data: skipped");
+
+        let mut st = DriverState::new();
+        st.retries = 9;
+        st.highest_probed = true;
+        assert!(!st.on_deadline(true, 2), "a slot with data is never skipped");
+    }
 
     #[test]
     fn repair_waits_once_the_seconds_budget_is_spent() {

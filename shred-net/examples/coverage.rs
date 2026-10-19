@@ -143,6 +143,7 @@ fn main() -> anyhow::Result<()> {
             keep_window:  args.probe_depth + 2000,
             target_window: args.window,
             top_peers:    args.top_peers,
+            repair_rate:  0,
         },
         keypair,
         sink.clone(),
