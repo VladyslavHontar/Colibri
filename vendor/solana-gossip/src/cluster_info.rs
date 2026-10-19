@@ -100,6 +100,11 @@ use {
 pub const GOSSIP_SLEEP_MILLIS: u64 = 100;
 /// Interval between pull requests (in gossip rounds)
 const PULL_REQUEST_PERIOD: usize = 5;
+/// Colibri: pull at the normal pace for this many rounds after start (to fill
+/// the peer table), then only every SLOW_PULL_PERIOD rounds. Pull responses
+/// are vote churn Colibri never reads (~3,000 packets/s at 1 pull / 500 ms).
+const STARTUP_PULL_ROUNDS: usize = 300;
+const SLOW_PULL_PERIOD: usize = 600;
 
 /// Capacity for the [`ClusterInfo::run_socket_consume`] and [`ClusterInfo::run_listen`]
 /// intermediate packet batch buffers.
@@ -1563,7 +1568,9 @@ impl ClusterInfo {
                         &stakes,
                         &sender,
                         // Make pull requests every PULL_REQUEST_PERIOD rounds
-                        gossip_round % PULL_REQUEST_PERIOD == 0,
+                        gossip_round % PULL_REQUEST_PERIOD == 0
+                            && (gossip_round < STARTUP_PULL_ROUNDS
+                                || gossip_round % SLOW_PULL_PERIOD == 0),
                     );
                     self.handle_purge(&thread_pool, &stakes);
                     entrypoints_processed = entrypoints_processed || self.process_entrypoints();

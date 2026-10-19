@@ -47,7 +47,9 @@ const CRDS_GOSSIP_PUSH_FANOUT: usize = 9;
 pub const CRDS_GOSSIP_PUSH_MSG_TIMEOUT_MS: u64 = 15000;
 const CRDS_GOSSIP_PRUNE_MSG_TIMEOUT_MS: u64 = 500;
 const CRDS_GOSSIP_PRUNE_STAKE_THRESHOLD_PCT: f64 = 0.15;
-const CRDS_GOSSIP_PRUNE_MIN_INGRESS_NODES: usize = 2;
+// Colibri: 0, not 2. It relays nothing, so it needs no redundant ingress;
+// every pusher is pruned.
+const CRDS_GOSSIP_PRUNE_MIN_INGRESS_NODES: usize = 0;
 const CRDS_GOSSIP_PUSH_ACTIVE_SET_SIZE: usize = CRDS_GOSSIP_PUSH_FANOUT + 3;
 
 pub struct CrdsGossipPush {

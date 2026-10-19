@@ -17,7 +17,8 @@ struct ReceivedCacheEntry {
 
 impl ReceivedCache {
     // Minimum number of upserts before a cache entry can be pruned.
-    const MIN_NUM_UPSERTS: usize = 20;
+    // Colibri: 2, not 20, so a pusher is pruned after its first few values.
+    const MIN_NUM_UPSERTS: usize = 2;
 
     pub(crate) fn new(capacity: usize) -> Self {
         Self(LruCache::new(capacity))
