@@ -10,13 +10,22 @@
 
 use {
     deshredder::{Deshredder, Event},
-    std::sync::Mutex,
+    std::{collections::BTreeMap, sync::Mutex},
 };
+
+/// Data shreds per FEC set. Agave shreds every set 32 data : 32 coding, and
+/// batches end on a set boundary (all 213,222 coding shreds in a 75 s mainnet
+/// capture, 2026-10-19).
+const SET_DATA: u64 = 32;
 
 /// One assembler shared by the insert worker and the repair driver.
 /// ponytail: a single mutex; insert and dispatch each hold it for microseconds.
 pub struct Reconstructor {
     asm: Mutex<Deshredder>,
+    /// Coding positions seen per (slot, fec_set_index), as a bitmask, for
+    /// slots not yet complete. The deshredder recovers a set once data +
+    /// coding reach 32 but does not say how close a set is.
+    code: Mutex<BTreeMap<(u64, u32), u64>>,
 }
 
 impl Default for Reconstructor {
@@ -27,7 +36,7 @@ impl Default for Reconstructor {
 
 impl Reconstructor {
     pub fn new() -> Self {
-        Self { asm: Mutex::new(Deshredder::new()) }
+        Self { asm: Mutex::new(Deshredder::new()), code: Mutex::new(BTreeMap::new()) }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Deshredder> {
@@ -37,9 +46,19 @@ impl Reconstructor {
     /// Push many raw packets under one lock; events (entry batches, footers,
     /// slot completions) are appended to `out`. Returns the packet count.
     pub fn insert_batch(&self, raws: &[Vec<u8>], out: &mut Vec<Event>) -> usize {
+        let from = out.len();
         let mut asm = self.lock();
+        let mut code = self.code.lock().unwrap_or_else(|e| e.into_inner());
         for raw in raws {
+            if let Some((key, position)) = coding_position(raw) {
+                *code.entry(key).or_default() |= 1 << position;
+            }
             asm.push(raw, out);
+        }
+        for ev in &out[from..] {
+            if let Event::SlotComplete { slot } = ev {
+                code.retain(|&(s, _), _| s != *slot);
+            }
         }
         raws.len()
     }
@@ -64,14 +83,26 @@ impl Reconstructor {
 
     /// Up to `max` missing data-shred indices for `slot` — the set that drives
     /// `WindowIndex` repair requests. Empty when the slot is full or untouched.
+    ///
+    /// Only as many per FEC set as its recovery still lacks: a set holding
+    /// `d` data and `c` coding shreds needs `32 - d - c` more, not all
+    /// `32 - d`. Turbine gives an unstaked node ~56% of each set (75 s
+    /// mainnet capture, 2026-10-19), so the lost sets sit just short of
+    /// recovery: 145 missing data shreds per slot, 51 needed.
     pub fn missing_indices(&self, slot: u64, max: usize) -> Vec<u64> {
-        self.lock().missing(slot, max).into_iter().map(u64::from).collect()
+        let missing = self.lock().missing(slot, usize::MAX);
+        let code = self.code.lock().unwrap_or_else(|e| e.into_inner());
+        needed(&missing, |set| code.get(&(slot, set)).map_or(0, |m| m.count_ones()))
+            .take(max)
+            .collect()
     }
 
     /// Forget every slot below `keep_from` (bounds memory; the assembler has
     /// no clock of its own).
     pub fn purge_below(&self, keep_from: u64) {
         self.lock().evict_below(keep_from);
+        let mut code = self.code.lock().unwrap_or_else(|e| e.into_inner());
+        *code = code.split_off(&(keep_from, 0));
     }
 
     /// Highest data index seen for `slot` (diagnostics).
@@ -83,6 +114,32 @@ impl Reconstructor {
     pub fn active_slots(&self) -> usize {
         self.lock().active_slots()
     }
+}
+
+/// `(slot, fec_set_index)` and position of a Merkle coding shred.
+fn coding_position(raw: &[u8]) -> Option<((u64, u32), u32)> {
+    if !matches!(raw.get(64)? >> 4, 0x6 | 0x7) {
+        return None;
+    }
+    let slot = u64::from_le_bytes(raw.get(65..73)?.try_into().ok()?);
+    let set = u32::from_le_bytes(raw.get(79..83)?.try_into().ok()?);
+    let position = u16::from_le_bytes(raw.get(87..89)?.try_into().ok()?);
+    (position < 64).then_some(((slot, set), u32::from(position)))
+}
+
+/// From ascending missing data indices, the first `missing - coding` of each
+/// FEC set: enough that the set can be rebuilt once they arrive.
+fn needed<'a>(
+    missing: &'a [u32],
+    coding: impl Fn(u32) -> u32 + 'a,
+) -> impl Iterator<Item = u64> + 'a {
+    missing
+        .chunk_by(|a, b| u64::from(*a) / SET_DATA == u64::from(*b) / SET_DATA)
+        .flat_map(move |run| {
+            let set = (u64::from(run[0]) / SET_DATA * SET_DATA) as u32;
+            let need = run.len().saturating_sub(coding(set) as usize);
+            run[..need].iter().map(|&i| u64::from(i))
+        })
 }
 
 #[cfg(test)]
@@ -126,6 +183,39 @@ mod tests {
             Event::Entries { entries, .. } => Some(entries.clone()),
             _ => None,
         }).flatten().collect()
+    }
+
+    #[test]
+    fn asks_only_what_each_fec_set_still_lacks() {
+        // Set 0 lacks 5 data shreds and holds 3 coding: 2 more rebuild it.
+        // Set 32 lacks 2 and holds none: both. Set 64 is already covered.
+        let missing = [1, 2, 3, 4, 5, 33, 40, 70];
+        let coding = |set| match set { 0 => 3, 64 => 9, _ => 0 };
+        assert_eq!(needed(&missing, coding).collect::<Vec<_>>(), vec![1, 2, 33, 40]);
+    }
+
+    /// Coding shreds count toward what a gap needs; a slot one coding shred
+    /// short asks for one data shred.
+    #[test]
+    fn coding_shreds_shrink_the_repair_ask() {
+        let slot = 300;
+        let shredder = Shredder::new(slot, slot - 1, 0, 0).unwrap();
+        let entries: Vec<Entry> = (0..300)
+            .map(|i| Entry { num_hashes: i as u64 % 4, hash: Hash::default(), transactions: vec![] })
+            .collect();
+        let (data, code) = shredder.entries_to_merkle_shreds_for_tests(
+            &Keypair::new(), &entries, true, Hash::default(), 0, 0,
+            &ReedSolomonCache::default(), &mut ProcessShredsStats::default());
+        assert!(data.len() >= 4 && data.len() as u64 <= SET_DATA, "one FEC set");
+        let r = Reconstructor::new();
+        // Keep the last data shred (length known), drop the first three, add
+        // two coding shreds: one data shred short of recovery.
+        let mut ev = Vec::new();
+        r.insert_batch(&data[3..].iter().chain(&code[..2]).map(raw).collect::<Vec<_>>(), &mut ev);
+        assert_eq!(r.missing_indices(slot, 128), vec![0]);
+        r.insert_batch(&[raw(&data[0])], &mut ev);
+        assert!(r.is_full(slot), "recovered with the one data shred asked for");
+        assert_eq!(entries_of(&ev), entries);
     }
 
     /// A whole slot inserted in ONE batched call completes and its events

@@ -43,6 +43,8 @@ Turbine sends shreds to the address Colibri **advertises** in gossip. Pick the o
 
 With `stun` Colibri asks the STUN server what address it sees, **from the very socket that will receive**, and advertises that mapping for gossip and TVU. A keep-alive re-probes every 20 s so the router never expires the TVU mapping (TVU never transmits on its own). Without it a NATed node joins gossip cleanly, shows up in peer tables, and then receives nothing.
 
+On a home connection, also set `"repair_rate": 1500` and a small `depth`, and keep the default `window` (64) and `top_peers` (128): unlimited repair sends tens of thousands of requests a second. The vendored `solana-gossip` (see `vendor/solana-gossip/PATCH.md`) is trimmed for such a link: it pushes only this node's own values (relaying the cluster's measured ~12,600 packets/s out), prunes every peer that pushes to it, and pulls once a minute after the first 30 s. Untrimmed, gossip alone brought in ~13,900 packets/s (~100 Mbit/s), and on a home Wi-Fi link that, not repair, was what lost shreds: 40-46% ping loss at 1.2-1.7 s RTT while Colibri ran. With the trims, a 12-minute run on the same link (2026-10-19) took ~2,000 gossip and ~6,300 turbine packets/s, kept ping loss at 1%, delivered every one of 3,277 slots except the last few in flight at shutdown, and stayed a median 2 slots (p99 14, worst 20 after the first 90 s) behind the RPC's processed slot. Repair needed a median 19 requests/s and hit the 1,500/s cap only while catching up at start.
+
 Limits: STUN only helps behind a full-cone NAT (endpoint-independent mapping and filtering). An address-restricted NAT passes the probe and still drops turbine. If gossip peers appear but no shreds arrive, that is the first thing to check. When both are set, `stun` wins: the probed address is advertised and `ip` is ignored.
 
 ## Configuration
@@ -66,6 +68,7 @@ Limits: STUN only helps behind a full-cone NAT (endpoint-independent mapping and
 | `depth` / `--depth` | `500` | Backfill depth from tip when no subscriber sends `from-slot` |
 | `window` / `--window` | `64` | Slots repaired in parallel |
 | `top_peers` / `--top-peers` | `128` | Distinct peers repair requests are spread across |
+| `repair_rate` / `--repair-rate` | `0` | Most repair requests sent per second; `0` is no limit. A home link wants ~1,500 (used only to catch up) |
 | `tier1_fanout` / `--tier1-fanout` | `200` | Stake table size for repair peer scoring |
 | `oracle_rpc` / `--oracle-rpc` | — | Cross-check completed slots against `getBlock` (debug) |
 

@@ -34,3 +34,9 @@ codegen-units = 16
 [patch.crates-io]
 librocksdb-sys = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
 rocksdb = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
+
+# Agave's gossip relays every fresh value it learns to 9 peers. On a home
+# connection that is ~12k packets/s up and takes the whole link down; the
+# vendored copy pushes only Colibri's own values. See vendor/solana-gossip/PATCH.md.
+[patch."https://github.com/anza-xyz/agave.git"]
+solana-gossip = { path = "vendor/solana-gossip" }

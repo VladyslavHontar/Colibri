@@ -43,6 +43,10 @@ pub fn next_repair_action(
     }
     match last_index {
         None if !highest_probed => RepairAction::ProbeHighest,
+        // Gaps below the highest index seen are needed whatever the length
+        // turns out to be; waiting on the probe left half the slots idle
+        // until the 30 s deadline (last LAST_IN_SLOT set lost to turbine).
+        None if !missing.is_empty() => RepairAction::RequestWindows(missing.to_vec()),
         None if repair_rounds >= orphan_after => RepairAction::RequestOrphan,
         None => RepairAction::Wait,
         Some(_) => {
@@ -73,6 +77,14 @@ mod tests {
         assert_eq!(
             next_repair_action(false, None, &[], true, 3, 5),
             RepairAction::Wait,
+        );
+    }
+
+    #[test]
+    fn request_gaps_below_highest_seen_while_length_unknown() {
+        assert_eq!(
+            next_repair_action(false, None, &[3, 4], true, 1, 5),
+            RepairAction::RequestWindows(vec![3, 4]),
         );
     }
 
