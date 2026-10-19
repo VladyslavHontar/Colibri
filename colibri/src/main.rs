@@ -310,13 +310,18 @@ fn fetch_tier1(rpc_url: &str, fanout: usize) -> Vec<(u64, [u8; 32])> {
 }
 
 /// Slot of a raw shred (LE u64 at offset 65), gated on the shred-variant byte
-/// at offset 64 — same recognizer shred-net's ingest uses.
+/// at offset 64. Coding shreds (0x4_/0x6_/0x7_) must pass too: they are half
+/// of turbine and what lets the deshredder rebuild lost data shreds. Until
+/// 2026-10-19 this gate admitted data shreds only, so no FEC set was ever
+/// recovered and every shred turbine lost had to be repaired (~7% of slots
+/// completed in 170 s at repair_rate 500).
 fn shred_slot(buf: &[u8]) -> Option<u64> {
     if buf.len() < 88 {
         return None;
     }
     let variant = buf[64];
-    let is_shred = matches!(variant & 0xF0, 0x80 | 0x90 | 0xB0) || variant == 0xA5;
+    let is_shred =
+        matches!(variant & 0xF0, 0x40 | 0x60 | 0x70 | 0x80 | 0x90 | 0xB0) || variant == 0xA5;
     if !is_shred {
         return None;
     }
@@ -333,6 +338,14 @@ mod shred_slot_tests {
         buf[64] = 0x80; // ShredVariant::MerkleData
         buf[65..73].copy_from_slice(&123u64.to_le_bytes());
         assert_eq!(shred_slot(&buf), Some(123));
+    }
+
+    #[test]
+    fn parses_slot_of_merkle_coding_shred() {
+        let mut buf = [0u8; 89];
+        buf[64] = 0x66; // chained Merkle code, proof_size 6
+        buf[65..73].copy_from_slice(&456u64.to_le_bytes());
+        assert_eq!(shred_slot(&buf), Some(456));
     }
 
     #[test]
