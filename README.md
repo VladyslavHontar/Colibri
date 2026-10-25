@@ -71,6 +71,7 @@ Limits: STUN only helps behind a full-cone NAT (endpoint-independent mapping and
 | `repair_rate` / `--repair-rate` | `0` | Most repair requests sent per second; `0` is no limit. A home link wants ~1,500 (used only to catch up) |
 | `tier1_fanout` / `--tier1-fanout` | `200` | Stake table size for repair peer scoring |
 | `oracle_rpc` / `--oracle-rpc` | — | Cross-check completed slots against `getBlock` (debug) |
+| `stall_secs` / `--stall-secs` | `60` | Exit after this many seconds without one shred, for the supervisor (`restart: unless-stopped`) to start it again; `0` never. A sleeping host or a forgotten NAT mapping otherwise leaves a live process that hears nothing |
 
 `colibri --help` prints the same list.
 
@@ -87,9 +88,9 @@ Proto: [`colibri/protos/shredstream.proto`](colibri/protos/shredstream.proto). T
 ## How it works
 
 1. **Gossip** (`shred-net`) joins the cluster and learns validators and their stake.
-2. **TVU** receives Turbine shreds; each one is verified against the slot leader's signature, fail-closed.
+2. **TVU** receives Turbine shreds; each one is verified against the slot leader's signature, fail-closed. The leader signs a FEC set's Merkle root once, so the first shred of a set is checked with ed25519 and the rest by their Merkle proof against that root, as agave does.
 3. **Assemble** feeds turbine and repair shreds into one in-memory deshredder (Reed-Solomon recovery). Entry batches stream out as soon as they are contiguous.
-4. **Repair** asks the deshredder what is missing and drives the repair protocol until every targeted slot is complete, marking never-produced slots as skipped.
+4. **Repair** asks the deshredder what is missing (of each FEC set only what its recovery still lacks) and drives the repair protocol until every targeted slot is complete, marking never-produced slots as skipped. Each request goes to a peer drawn by stake, as agave's repair draws them, never to the leader of the moment or the next one: a leading node charges ten times the cost for what it serves.
 5. **gRPC** fans the result out to subscribers.
 
 ## Coverage

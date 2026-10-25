@@ -1843,7 +1843,7 @@ dependencies = [
 [[package]]
 name = "deshredder"
 version = "0.2.0"
-source = "git+https://github.com/VladyslavHontar/Deshreder.git?rev=f2044c43e9a6b8e31ab674550c17ee2dea7bc1b0#f2044c43e9a6b8e31ab674550c17ee2dea7bc1b0"
+source = "git+https://github.com/VladyslavHontar/Deshreder.git?rev=de36f11f2d82183f986a5da0afb66d7cd4d84e9f#de36f11f2d82183f986a5da0afb66d7cd4d84e9f"
 dependencies = [
  "reed-solomon-erasure",
  "sha2 0.10.9",
