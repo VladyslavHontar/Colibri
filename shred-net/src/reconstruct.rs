@@ -74,9 +74,14 @@ impl Reconstructor {
         self.lock().needed(slot, max).into_iter().map(u64::from).collect()
     }
 
-    /// Shreds dropped for proving another Merkle root than their FEC set's.
+    /// Shreds that contradicted their slot's others, giving the slot up.
     pub fn conflicts(&self) -> u64 {
         self.lock().conflicts()
+    }
+
+    /// Entries streamed before the batch they are in was whole.
+    pub fn early_entries(&self) -> u64 {
+        self.lock().early_entries()
     }
 
     /// Forget every slot below `keep_from` (bounds memory; the assembler has

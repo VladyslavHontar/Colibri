@@ -20,7 +20,7 @@ solana-signature  = { version = "=3.5.2", default-features = false }
 sha2              = "0.10"
 
 # Reconstruction: the ephemeral, repair-driven agave Blockstore (FEC sets,
-deshredder    = { git = "https://github.com/VladyslavHontar/Deshreder.git", rev = "de36f11f2d82183f986a5da0afb66d7cd4d84e9f" }
+deshredder    = { git = "https://github.com/VladyslavHontar/Deshreder.git", rev = "d20a61e88eea772fdb5ba1fd2a2ead03b2cefd79" }
 solana-entry  = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0" }
 anyhow        = "1"
 
