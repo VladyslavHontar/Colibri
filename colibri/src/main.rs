@@ -59,6 +59,12 @@ const MAINNET_ENTRYPOINTS: [&str; 5] = [
 ];
 const DEFAULT_CONFIG_PATH: &str = "colibri.json";
 const TIER1_REFRESH_SECS: u64 = 600;
+/// Verified `(root, signature)` pairs kept: a slot holds a few dozen FEC sets,
+/// so this is the sets of several hundred slots, far more than are in flight.
+const VERIFIED_ROOTS: usize = 16_384;
+/// Slots ahead of the tip whose leaders repair leaves alone: the leader now
+/// and the next, a leader window being 4 slots.
+const LEADERS_AHEAD: u64 = 8;
 
 fn print_usage() {
     eprintln!("Usage: colibri [OPTIONS]");
@@ -92,6 +98,7 @@ fn print_usage() {
     eprintln!("  --top-peers <N>         Distinct peers repair requests are spread across (default: 128)");
     eprintln!("  --repair-rate <N>       Most repair requests sent per second, 0 = no limit (default: 0)");
     eprintln!("  --oracle-rpc <URL>      Enable RPC oracle cross-check (samples completed slots via getBlock)");
+    eprintln!("  --stall-secs <N>        Exit after N s without one shred, for the supervisor to restart it; 0 = never (default: 60)");
     eprintln!("  --help                  Print this help");
 }
 
@@ -115,6 +122,9 @@ struct Config {
     top_peers:     usize,
     repair_rate:   u64,
     oracle_rpc:    Option<String>,
+    /// Seconds without one shred after which the node exits, for its
+    /// supervisor to start it again; 0 never.
+    stall_secs:    u64,
 }
 
 fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
@@ -138,6 +148,7 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
     let mut top_peers: usize = 128;
     let mut repair_rate: u64 = 0;
     let mut oracle_rpc: Option<String> = None;
+    let mut stall_secs: u64 = 60;
 
     // Config file first, so every flag below simply overrides it. `--config`
     // names it explicitly; otherwise ./colibri.json is used when it exists.
@@ -153,8 +164,9 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
         let str_ = |k: &str| obj.get(k).map(|x| x.as_str().map(str::to_string).ok_or(format!("config {path}: `{k}` must be a string"))).transpose();
         let num = |k: &str| obj.get(k).map(|x| x.as_u64().ok_or(format!("config {path}: `{k}` must be an integer"))).transpose();
         for key in obj.keys() {
-            const KNOWN: [&str; 19] = ["ip","port","tvu_port","repair_port","stun","entrypoints","shred_version","rpc",
-                "tier1_fanout","grpc_port","auth_token","tls_cert","tls_key","keypair","depth","window","top_peers","repair_rate","oracle_rpc"];
+            const KNOWN: [&str; 20] = ["ip","port","tvu_port","repair_port","stun","entrypoints","shred_version","rpc",
+                "tier1_fanout","grpc_port","auth_token","tls_cert","tls_key","keypair","depth","window","top_peers","repair_rate","oracle_rpc",
+                "stall_secs"];
             if !KNOWN.contains(&key.as_str()) {
                 return Err(format!("config {path}: unknown key `{key}` (known: {})", KNOWN.join(", ")).into());
             }
@@ -177,6 +189,7 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
         if let Some(x) = num("top_peers")?      { top_peers = x as usize; }
         if let Some(x) = num("repair_rate")?    { repair_rate = x; }
         if let Some(x) = str_("oracle_rpc")?    { oracle_rpc = Some(x); }
+        if let Some(x) = num("stall_secs")?     { stall_secs = x; }
         if let Some(arr) = obj.get("entrypoints") {
             let arr = arr.as_array().ok_or_else(|| format!("config {path}: `entrypoints` must be an array"))?;
             for e in arr {
@@ -209,6 +222,7 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
             "--top-peers"     => { i += 1; top_peers     = args[i].parse()?; }
             "--repair-rate"   => { i += 1; repair_rate   = args[i].parse()?; }
             "--oracle-rpc"    => { i += 1; oracle_rpc    = Some(args[i].clone()); }
+            "--stall-secs"    => { i += 1; stall_secs    = args[i].parse()?; }
             "--help" | "-h"   => { print_usage(); std::process::exit(0); }
             other => {
                 eprintln!("Unknown argument: {other}");
@@ -236,7 +250,7 @@ fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
     Ok(Config {
         ip, port, tvu_port, repair_port, stun_server, entrypoints, shred_version,
         rpc_url, tier1_fanout, grpc_port, auth_token, tls_cert, tls_key,
-        keypair_path, depth, window, top_peers, repair_rate, oracle_rpc,
+        keypair_path, depth, window, top_peers, repair_rate, oracle_rpc, stall_secs,
     })
 }
 
@@ -380,6 +394,13 @@ struct ColibriSink {
     sv_verified:   AtomicU64,
     sv_rejected:   AtomicU64,
     sv_no_leader:  AtomicU64,
+    /// Shreds admitted on a root whose signature was checked before.
+    sv_cached:     AtomicU64,
+    /// `(Merkle root, signature)` pairs whose signature by the slot's leader
+    /// checked out. Every shred of a FEC set proves its place under one root,
+    /// signed once, so one ed25519 check admits the whole set, as agave's own
+    /// cache does (`ledger/src/sigverify_shreds.rs`).
+    verified_roots: Mutex<HashSet<([u8; 32], [u8; 64])>>,
     entry_tx:      Arc<broadcast::Sender<ProtoEntry>>,
     tx_tx:         Arc<broadcast::Sender<ProtoTransaction>>,
     footer_tx:     Arc<broadcast::Sender<ProtoFooter>>,
@@ -429,6 +450,13 @@ impl ColibriSink {
 }
 
 impl BlockSink for ColibriSink {
+    fn leaders_near(&self, slot: u64) -> Vec<[u8; 32]> {
+        let mut schedule = self.leader_sched.lock().unwrap_or_else(|e| e.into_inner());
+        let mut leaders: Vec<[u8; 32]> = (slot..=slot + LEADERS_AHEAD).filter_map(|s| schedule.leader_for_slot(s)).map(|pk| pk.to_bytes()).collect();
+        leaders.dedup();
+        leaders
+    }
+
     /// Sigverify gate. Fail-closed for BOTH branches (agave-faithful):
     ///   * leader known  → verify signature over the Merkle root; DROP on
     ///                     failure.
@@ -438,23 +466,40 @@ impl BlockSink for ColibriSink {
     /// stream) and keeps it from advancing the observed tip.
     fn on_raw_shred(&self, bytes: &[u8]) -> bool {
         let Some(slot) = shred_slot(bytes) else { return false };
-
-        let leader = self
-            .leader_sched
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .leader_for_slot(slot);
-        match leader {
-            Some(pk) => {
-                if !sigverify::verify_shred_signature(bytes, &pk) {
-                    self.sv_rejected.fetch_add(1, Ordering::Relaxed);
+        let (Some(root), Some(Ok(sig))) = (deshredder::merkle_root(bytes), bytes.get(..64).map(<[u8; 64]>::try_from)) else {
+            self.sv_rejected.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        // The root binds the slot and the shred's place: a known pair is the
+        // leader's set, whatever shred of it this is.
+        let known = self.verified_roots.lock().unwrap_or_else(|e| e.into_inner()).contains(&(root, sig));
+        if known {
+            self.sv_cached.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let leader = self
+                .leader_sched
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .leader_for_slot(slot);
+            match leader {
+                Some(pk) => {
+                    if !sigverify::verify_root(&sig, &root, &pk) {
+                        self.sv_rejected.fetch_add(1, Ordering::Relaxed);
+                        return false;
+                    }
+                    self.sv_verified.fetch_add(1, Ordering::Relaxed);
+                    let mut roots = self.verified_roots.lock().unwrap_or_else(|e| e.into_inner());
+                    // ponytail: dropped whole when full, about the sets of the
+                    // last few hundred slots; an LRU if re-verifying them shows.
+                    if roots.len() >= VERIFIED_ROOTS {
+                        roots.clear();
+                    }
+                    roots.insert((root, sig));
+                }
+                None => {
+                    self.sv_no_leader.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
-                self.sv_verified.fetch_add(1, Ordering::Relaxed);
-            }
-            None => {
-                self.sv_no_leader.fetch_add(1, Ordering::Relaxed);
-                return false;
             }
         }
 
@@ -531,12 +576,13 @@ impl BlockSink for ColibriSink {
         if st.last_log.elapsed() >= Duration::from_secs(10) {
             eprintln!(
                 "[stream] admitted={} published={} footers={} tip={} \
-                 sigverify[ok={} rejected={} dropped_no_leader={}]",
+                 sigverify[ok={} by_known_root={} rejected={} dropped_no_leader={}]",
                 st.admitted,
                 st.published,
                 st.footers,
                 self.tip.load(Ordering::Relaxed),
                 self.sv_verified.load(Ordering::Relaxed),
+                self.sv_cached.load(Ordering::Relaxed),
                 self.sv_rejected.load(Ordering::Relaxed),
                 self.sv_no_leader.load(Ordering::Relaxed),
             );
@@ -791,6 +837,8 @@ fn main() -> Result<()> {
         sv_verified:   AtomicU64::new(0),
         sv_rejected:   AtomicU64::new(0),
         sv_no_leader:  AtomicU64::new(0),
+        sv_cached:     AtomicU64::new(0),
+        verified_roots: Mutex::new(HashSet::new()),
         entry_tx,
         tx_tx,
         footer_tx,
@@ -872,6 +920,14 @@ fn main() -> Result<()> {
         }
         while let Ok(map) = stake_rx.try_recv() {
             net.set_stakes(map);
+        }
+        // A node that hears nothing has lost the network (the host slept, the
+        // NAT forgot its mapping, the link went), and on 2026-10-25 one sat so
+        // for ~265,000 slots with every thread alive. Starting again rejoins
+        // gossip and asks STUN anew; the supervisor does that.
+        if let Some(silent) = net.silent_for().filter(|s| cfg.stall_secs > 0 && s.as_secs() >= cfg.stall_secs) {
+            eprintln!("[colibri] no shred for {}s: the network is lost; exiting for the supervisor to start it again", silent.as_secs());
+            std::process::exit(3);
         }
         let tip = net.observed_tip();
         if tip == 0 {

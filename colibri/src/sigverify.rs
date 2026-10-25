@@ -21,9 +21,10 @@
 //!   ok   = sig.verify(leader_pubkey.as_ref(), root.as_ref())
 //! ```
 //!
-//! This mirrors agave exactly (see `verify_shred_cpu`), minus the process-wide LRU
-//! cache of `(signature, pubkey, merkle_root)` triples — that is a throughput
-//! optimization, not part of the correctness contract.
+//! This mirrors agave (see `verify_shred_cpu`), its cache included: every
+//! shred of a FEC set carries the one signed root, so `main.rs` keeps the
+//! `(root, signature)` pairs it has checked and admits the rest of a set on
+//! its Merkle proof alone, one ed25519 check per set.
 //!
 //! # Leader-schedule source (see `LeaderScheduleCache`)
 //!
@@ -61,28 +62,14 @@ use {
 /// probes at most a few epochs back. Oldest epochs are evicted past this.
 const MAX_CACHED_EPOCHS: usize = 4;
 
-/// Verify a single shred's signature against the given slot leader.
-///
-/// Returns `true` iff the shred is a well-formed Merkle shred whose common-header
-/// signature is a valid ed25519 signature by `leader` over the shred's Merkle root.
-/// Legacy (non-Merkle) shreds and malformed buffers return `false`.
+/// Whether `sig_bytes`, a shred's first 64 bytes, is `leader`'s signature of
+/// `root`, the Merkle root the shred proves its place under.
 #[must_use]
-pub fn verify_shred_signature(shred: &[u8], leader: &Pubkey) -> bool {
-    // Signature occupies the first 64 bytes of the common header (agave
-    // `shred::wire::get_signature`: `shred[0..64]`).
-    let Some(sig_bytes) = shred.get(..64) else {
+pub fn verify_root(sig_bytes: &[u8], root: &[u8; 32], leader: &Pubkey) -> bool {
+    let Ok(sig) = <[u8; 64]>::try_from(sig_bytes) else {
         return false;
     };
-    let sig = Signature::from(<[u8; 64]>::try_from(sig_bytes).unwrap());
-
-    // Merkle root is the signed message. The deshredder walks the proof
-    // embedded in the shred payload (checked against agave's
-    // `layout::get_merkle_root`); `None` for legacy/malformed shreds.
-    let Some(root) = deshredder::merkle_root(shred) else {
-        return false;
-    };
-
-    sig.verify(leader.as_ref(), &root)
+    Signature::from(sig).verify(leader.as_ref(), root)
 }
 
 /// Epoch↔slot arithmetic, mirroring agave's `EpochSchedule` in the post-warmup
@@ -380,8 +367,9 @@ mod tests {
     #[test]
     fn garbage_shred_fails_verification() {
         let leader = Pubkey::new_unique();
-        assert!(!verify_shred_signature(&[0u8; 32], &leader), "too short → false");
-        assert!(!verify_shred_signature(&[0u8; 1203], &leader), "not a valid merkle shred → false");
+        assert!(deshredder::merkle_root(&[0u8; 1203]).is_none(), "not a merkle shred: no root to check, rejected");
+        assert!(!verify_root(&[0u8; 32], &[0u8; 32], &leader), "too short a signature → false");
+        assert!(!verify_root(&[0u8; 64], &[7u8; 32], &leader), "not the leader's signature → false");
     }
 
     // NOTE: a positive round-trip test (create a real leader-signed Merkle shred

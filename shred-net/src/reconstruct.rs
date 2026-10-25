@@ -4,28 +4,19 @@
 //! into one [`Deshredder`], which rebuilds lost data shreds from coding
 //! shreds (Reed–Solomon) and emits each entry batch the moment it is
 //! contiguous. The repair driver asks [`Reconstructor::missing_indices`]
-//! which data shreds are still absent and fetches them until
+//! which data shreds are still worth fetching and fetches them until
 //! [`Reconstructor::is_full`]; nothing is stored on disk and nothing is read
 //! back — the entries leave through the events `insert_batch` returns.
 
 use {
     deshredder::{Deshredder, Event},
-    std::{collections::BTreeMap, sync::Mutex},
+    std::sync::Mutex,
 };
-
-/// Data shreds per FEC set. Agave shreds every set 32 data : 32 coding, and
-/// batches end on a set boundary (all 213,222 coding shreds in a 75 s mainnet
-/// capture, 2026-10-19).
-const SET_DATA: u64 = 32;
 
 /// One assembler shared by the insert worker and the repair driver.
 /// ponytail: a single mutex; insert and dispatch each hold it for microseconds.
 pub struct Reconstructor {
     asm: Mutex<Deshredder>,
-    /// Coding positions seen per (slot, fec_set_index), as a bitmask, for
-    /// slots not yet complete. The deshredder recovers a set once data +
-    /// coding reach 32 but does not say how close a set is.
-    code: Mutex<BTreeMap<(u64, u32), u64>>,
 }
 
 impl Default for Reconstructor {
@@ -36,7 +27,7 @@ impl Default for Reconstructor {
 
 impl Reconstructor {
     pub fn new() -> Self {
-        Self { asm: Mutex::new(Deshredder::new()), code: Mutex::new(BTreeMap::new()) }
+        Self { asm: Mutex::new(Deshredder::new()) }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Deshredder> {
@@ -46,19 +37,9 @@ impl Reconstructor {
     /// Push many raw packets under one lock; events (entry batches, footers,
     /// slot completions) are appended to `out`. Returns the packet count.
     pub fn insert_batch(&self, raws: &[Vec<u8>], out: &mut Vec<Event>) -> usize {
-        let from = out.len();
         let mut asm = self.lock();
-        let mut code = self.code.lock().unwrap_or_else(|e| e.into_inner());
         for raw in raws {
-            if let Some((key, position)) = coding_position(raw) {
-                *code.entry(key).or_default() |= 1 << position;
-            }
             asm.push(raw, out);
-        }
-        for ev in &out[from..] {
-            if let Event::SlotComplete { slot } = ev {
-                code.retain(|&(s, _), _| s != *slot);
-            }
         }
         raws.len()
     }
@@ -90,19 +71,18 @@ impl Reconstructor {
     /// mainnet capture, 2026-10-19), so the lost sets sit just short of
     /// recovery: 145 missing data shreds per slot, 51 needed.
     pub fn missing_indices(&self, slot: u64, max: usize) -> Vec<u64> {
-        let missing = self.lock().missing(slot, usize::MAX);
-        let code = self.code.lock().unwrap_or_else(|e| e.into_inner());
-        needed(&missing, |set| code.get(&(slot, set)).map_or(0, |m| m.count_ones()))
-            .take(max)
-            .collect()
+        self.lock().needed(slot, max).into_iter().map(u64::from).collect()
+    }
+
+    /// Shreds dropped for proving another Merkle root than their FEC set's.
+    pub fn conflicts(&self) -> u64 {
+        self.lock().conflicts()
     }
 
     /// Forget every slot below `keep_from` (bounds memory; the assembler has
     /// no clock of its own).
     pub fn purge_below(&self, keep_from: u64) {
         self.lock().evict_below(keep_from);
-        let mut code = self.code.lock().unwrap_or_else(|e| e.into_inner());
-        *code = code.split_off(&(keep_from, 0));
     }
 
     /// Highest data index seen for `slot` (diagnostics).
@@ -114,32 +94,6 @@ impl Reconstructor {
     pub fn active_slots(&self) -> usize {
         self.lock().active_slots()
     }
-}
-
-/// `(slot, fec_set_index)` and position of a Merkle coding shred.
-fn coding_position(raw: &[u8]) -> Option<((u64, u32), u32)> {
-    if !matches!(raw.get(64)? >> 4, 0x6 | 0x7) {
-        return None;
-    }
-    let slot = u64::from_le_bytes(raw.get(65..73)?.try_into().ok()?);
-    let set = u32::from_le_bytes(raw.get(79..83)?.try_into().ok()?);
-    let position = u16::from_le_bytes(raw.get(87..89)?.try_into().ok()?);
-    (position < 64).then_some(((slot, set), u32::from(position)))
-}
-
-/// From ascending missing data indices, the first `missing - coding` of each
-/// FEC set: enough that the set can be rebuilt once they arrive.
-fn needed<'a>(
-    missing: &'a [u32],
-    coding: impl Fn(u32) -> u32 + 'a,
-) -> impl Iterator<Item = u64> + 'a {
-    missing
-        .chunk_by(|a, b| u64::from(*a) / SET_DATA == u64::from(*b) / SET_DATA)
-        .flat_map(move |run| {
-            let set = (u64::from(run[0]) / SET_DATA * SET_DATA) as u32;
-            let need = run.len().saturating_sub(coding(set) as usize);
-            run[..need].iter().map(|&i| u64::from(i))
-        })
 }
 
 #[cfg(test)]
@@ -185,15 +139,6 @@ mod tests {
         }).flatten().collect()
     }
 
-    #[test]
-    fn asks_only_what_each_fec_set_still_lacks() {
-        // Set 0 lacks 5 data shreds and holds 3 coding: 2 more rebuild it.
-        // Set 32 lacks 2 and holds none: both. Set 64 is already covered.
-        let missing = [1, 2, 3, 4, 5, 33, 40, 70];
-        let coding = |set| match set { 0 => 3, 64 => 9, _ => 0 };
-        assert_eq!(needed(&missing, coding).collect::<Vec<_>>(), vec![1, 2, 33, 40]);
-    }
-
     /// Coding shreds count toward what a gap needs; a slot one coding shred
     /// short asks for one data shred.
     #[test]
@@ -206,7 +151,7 @@ mod tests {
         let (data, code) = shredder.entries_to_merkle_shreds_for_tests(
             &Keypair::new(), &entries, true, Hash::default(), 0, 0,
             &ReedSolomonCache::default(), &mut ProcessShredsStats::default());
-        assert!(data.len() >= 4 && data.len() as u64 <= SET_DATA, "one FEC set");
+        assert!(data.len() >= 4 && data.len() <= 32, "one FEC set of 32 data shreds");
         let r = Reconstructor::new();
         // Keep the last data shred (length known), drop the first three, add
         // two coding shreds: one data shred short of recovery.

@@ -66,6 +66,13 @@ pub trait BlockSink: Send + Sync + 'static {
     fn on_raw_shred(&self, _bytes: &[u8]) -> bool {
         true
     }
+    /// Identities leading at `slot` or soon after. Repair is not asked of
+    /// them: a node that leads charges ten times the cost for what it serves
+    /// (agave `serve_repair`, `LEADER_BYTE_COST_MULTIPLIER`), so it answers
+    /// little while it builds blocks. Default: none known.
+    fn leaders_near(&self, _slot: u64) -> Vec<[u8; 32]> {
+        Vec::new()
+    }
 }
 
 /// Configuration for a `ShredNet` instance.
@@ -126,6 +133,76 @@ struct Diag {
     pings:     AtomicU64,
     pongs:     AtomicU64,
     chan_drop: AtomicU64,
+    /// When the last admitted shred arrived, turbine or repair, unix ms; 0 before the first.
+    last_shred_ms: AtomicU64,
+    /// For each FEC set seen, `(slot, fec_set_index)`, the positions of it that
+    /// came from turbine: data 0..32, coding 32..64. A set seen only through
+    /// repair is here with none. What turbine gives a node decides how much
+    /// repair it needs.
+    coverage: Mutex<BTreeMap<(u64, u32), u64>>,
+}
+
+impl Diag {
+    fn admitted(&self, bytes: &[u8], from_turbine: bool) {
+        self.last_shred_ms.store(now_millis(), Ordering::Relaxed);
+        if let Some((set, position)) = set_position(bytes) {
+            let mut coverage = self.coverage.lock().unwrap_or_else(|e| e.into_inner());
+            let seen = coverage.entry(set).or_default();
+            if from_turbine {
+                *seen |= 1 << position;
+            }
+        }
+    }
+}
+
+/// A Merkle shred's `(slot, fec_set_index)` and its place in a 32:32 set:
+/// data 0..32 by index, coding 32..64 by position. `None` for any other shape.
+fn set_position(buf: &[u8]) -> Option<((u64, u32), u32)> {
+    let slot = u64::from_le_bytes(buf.get(65..73)?.try_into().ok()?);
+    let index = u32::from_le_bytes(buf.get(73..77)?.try_into().ok()?);
+    let set = u32::from_le_bytes(buf.get(79..83)?.try_into().ok()?);
+    let position = match buf.get(64)? >> 4 {
+        0x9 | 0xb => index.checked_sub(set).filter(|p| *p < 32)?,
+        0x6 | 0x7 => 32 + u32::from(u16::from_le_bytes(buf.get(87..89)?.try_into().ok()?)).min(32),
+        _ => return None,
+    };
+    (position < 64).then_some(((slot, set), position))
+}
+
+/// How many of each settled FEC set came from turbine, as `[sets, p10, p50,
+/// p90, recoverable %]`; recoverable is 32 or more of 64, enough to rebuild
+/// the set with no repair. Takes the sets below `before` out of `coverage`.
+fn coverage_below(coverage: &mut BTreeMap<(u64, u32), u64>, before: u64) -> Option<[f64; 5]> {
+    let rest = coverage.split_off(&(before, 0));
+    let settled = std::mem::replace(coverage, rest);
+    let mut counts: Vec<u32> = settled.values().map(|m| m.count_ones()).collect();
+    if counts.is_empty() {
+        return None;
+    }
+    counts.sort_unstable();
+    let at = |q: f64| f64::from(counts[((counts.len() - 1) as f64 * q) as usize]);
+    let recoverable = counts.iter().filter(|c| **c >= 32).count();
+    Some([counts.len() as f64, at(0.1), at(0.5), at(0.9), 100.0 * recoverable as f64 / counts.len() as f64])
+}
+
+/// A peer drawn with odds by `weights`; evenly where they are all 0.
+// ponytail: xorshift, not a crate's RNG: it only spreads requests across peers.
+fn weighted(weights: &[u64], rng: &mut u64) -> usize {
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 7;
+    *rng ^= *rng << 17;
+    let total: u64 = weights.iter().sum();
+    if total == 0 {
+        return (*rng % weights.len().max(1) as u64) as usize;
+    }
+    let mut at = *rng % total;
+    weights.iter().position(|w| match at.checked_sub(*w) {
+        Some(left) => {
+            at = left;
+            false
+        }
+        None => true,
+    }).unwrap_or(0)
 }
 
 /// Per-targeted-slot driver bookkeeping (the have/last_index/is_full state lives
@@ -181,6 +258,7 @@ pub struct ShredNet {
     targets:      Arc<Mutex<VecDeque<u64>>>,
     stakes:       Arc<Mutex<HashMap<[u8; 32], u64>>>,
     observed_tip: Arc<AtomicU64>,
+    diag:         Arc<Diag>,
     handles:      Vec<JoinHandle<()>>,
     // Kept alive so gossip threads keep running; never read directly.
     _gossip:      solana_gossip::gossip_service::GossipService,
@@ -290,7 +368,7 @@ impl ShredNet {
             targets.clone(),
             stakes.clone(),
             observed_tip.clone(),
-            diag,
+            diag.clone(),
         ));
 
         Ok(Self {
@@ -298,6 +376,7 @@ impl ShredNet {
             targets,
             stakes,
             observed_tip,
+            diag,
             handles,
             _gossip: node.gossip_service,
         })
@@ -318,6 +397,14 @@ impl ShredNet {
     /// Highest slot observed on the TVU socket so far (0 until the first shred).
     pub fn observed_tip(&self) -> u64 {
         self.observed_tip.load(Ordering::Relaxed)
+    }
+
+    /// How long since the last shred arrived, turbine or repair; `None`
+    /// before the first. A node that hears nothing has lost the network,
+    /// whatever its threads say.
+    pub fn silent_for(&self) -> Option<Duration> {
+        let last = self.diag.last_shred_ms.load(Ordering::Relaxed);
+        (last > 0).then(|| Duration::from_millis(now_millis().saturating_sub(last)))
     }
 
     /// Signal shutdown and join the worker threads.
@@ -378,6 +465,7 @@ fn spawn_tvu(
                     // Fail-closed: an unadmitted (unverified) shred neither
                     // advances the tip nor reaches the assembler.
                     if sink.on_raw_shred(bytes) {
+                        diag.admitted(bytes, true);
                         if let Some(slot) = slot_of(bytes) {
                             observed_tip.fetch_max(slot, Ordering::Relaxed);
                         }
@@ -423,10 +511,11 @@ fn spawn_repair_recv(
                     wire::Inbound::ShredResponse => {
                         diag.resp.fetch_add(1, Ordering::Relaxed);
                         // Same fail-closed gate as the TVU path.
-                        if sink.on_raw_shred(&buf[..n])
-                            && !submit(&insert_tx, &buf[..n], &diag)
-                        {
-                            break;
+                        if sink.on_raw_shred(&buf[..n]) {
+                            diag.admitted(&buf[..n], false);
+                            if !submit(&insert_tx, &buf[..n], &diag) {
+                                break;
+                            }
                         }
                     }
                     wire::Inbound::Other => {}
@@ -513,6 +602,7 @@ fn spawn_dispatch(
         // consumer was told via on_slot_skipped.
         let mut skipped: HashSet<u64> = HashSet::new();
         let mut nonce: u32 = 0xdead_beef;
+        let mut rng: u64 = now_millis() | 1;
         let mut last_purge = Instant::now();
         let mut last_diag = Instant::now();
         // Requests that may go out now; `None` is no limit. A token bucket
@@ -546,7 +636,12 @@ fn spawn_dispatch(
             // ── select peers ──
             let now_ms = now_millis();
             let stake_map = stakes.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let peers = gossip::repair_peers(&cluster_info, &stake_map, now_ms, top_peers);
+            let mut peers = gossip::repair_peers(&cluster_info, &stake_map, now_ms, top_peers);
+            let busy = sink.leaders_near(observed_tip.load(Ordering::Relaxed));
+            peers.retain(|(pk, _)| !busy.contains(pk));
+            // Each request goes to a peer drawn by stake, as agave's own repair
+            // draws them: a staked node answers more, and no peer is asked in turn.
+            let weights: Vec<u64> = peers.iter().map(|(pk, _)| stake_map.get(pk).copied().unwrap_or(0)).collect();
 
             if let (Some(left), Some(rate)) = (budget.as_mut(), repair_rate) {
                 if let Some(add) = refill(rate, budget_since.elapsed()) {
@@ -664,9 +759,8 @@ fn spawn_dispatch(
                             // ~Nx redundant and trips serve_repair's per-requester
                             // rate limit; unserved indices retry next round against
                             // a different peer.
-                            for (i, idx) in batch[..n].iter().enumerate() {
-                                let (pk, addr) =
-                                    &peers[(i + state.repair_rounds as usize) % peers.len()];
+                            for idx in &batch[..n] {
+                                let (pk, addr) = &peers[weighted(&weights, &mut rng)];
                                 let req = wire::window_index(&keypair, pk, slot, *idx, nonce);
                                 send_counted(&repair_sock, &req, addr, &diag);
                                 nonce = nonce.wrapping_add(1);
@@ -753,6 +847,16 @@ fn spawn_dispatch(
                     take(&diag.pings), take(&diag.pongs),
                     known, driver.len(), full, reconstructor.active_slots(), gaps,
                 );
+                // Sets well behind the tip have had all their turbine shreds.
+                let settled_before = observed_tip.load(Ordering::Relaxed).saturating_sub(64);
+                let mut coverage = diag.coverage.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some([sets, p10, p50, p90, recoverable]) = coverage_below(&mut coverage, settled_before) {
+                    eprintln!(
+                        "[coverage] {sets:.0} FEC sets, of 64 shreds each from turbine: p10={p10:.0} p50={p50:.0} p90={p90:.0}; \
+                         {recoverable:.1}% rebuildable without repair | leaders skipped for repair={} root conflicts={}",
+                        busy.len(), reconstructor.conflicts(),
+                    );
+                }
                 last_diag = Instant::now();
             }
 
@@ -815,9 +919,48 @@ fn set_recv_buffer(socket: &UdpSocket, bytes: usize) {
 #[cfg(test)]
 mod tests {
     use {
-        super::{grant, refill, DriverState},
-        std::time::Duration,
+        super::{coverage_below, grant, refill, set_position, weighted, DriverState},
+        std::{collections::BTreeMap, time::Duration},
     };
+
+    /// A packet with only the fields `set_position` reads.
+    fn shred(variant: u8, slot: u64, index: u32, set: u32, position: u16) -> Vec<u8> {
+        let mut b = vec![0u8; 1228];
+        b[64] = variant;
+        b[65..73].copy_from_slice(&slot.to_le_bytes());
+        b[73..77].copy_from_slice(&index.to_le_bytes());
+        b[79..83].copy_from_slice(&set.to_le_bytes());
+        b[87..89].copy_from_slice(&position.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn places_a_shred_in_its_set() {
+        assert_eq!(set_position(&shred(0x96, 7, 69, 64, 0)), Some(((7, 64), 5)), "data by index");
+        assert_eq!(set_position(&shred(0x66, 7, 99, 64, 3)), Some(((7, 64), 35)), "coding after the data");
+        assert_eq!(set_position(&shred(0x96, 7, 99, 64, 0)), None, "a data index past a 32-shred set");
+        assert_eq!(set_position(&shred(0x66, 7, 0, 64, 40)), None, "a coding position past 32");
+        assert_eq!(set_position(&shred(0xa5, 7, 1, 0, 0)), None, "legacy");
+    }
+
+    #[test]
+    fn tells_how_much_of_each_settled_set_turbine_gave() {
+        let mut coverage = BTreeMap::from([((1, 0), u64::MAX), ((1, 32), 0), ((2, 0), (1 << 31) - 1), ((9, 0), 1)]);
+        let [sets, p10, p50, p90, recoverable] = coverage_below(&mut coverage, 5).unwrap();
+        assert_eq!((sets, p10, p50, p90, recoverable), (3.0, 0.0, 31.0, 31.0, 100.0 / 3.0));
+        assert_eq!(coverage.len(), 1, "the set not settled yet stays");
+        assert!(coverage_below(&mut coverage, 5).is_none());
+    }
+
+    #[test]
+    fn draws_peers_by_stake() {
+        let mut rng = 42;
+        let draws: Vec<usize> = (0..1000).map(|_| weighted(&[0, 30, 0, 70], &mut rng)).collect();
+        assert!(draws.iter().all(|d| [1, 3].contains(d)), "no stake, never drawn");
+        let heavy = draws.iter().filter(|d| **d == 3).count();
+        assert!((600..800).contains(&heavy), "about 70% to the 70: {heavy}");
+        assert!((0..100).map(|_| weighted(&[0, 0, 0], &mut rng)).collect::<std::collections::HashSet<_>>().len() == 3, "evenly with none staked");
+    }
 
     #[test]
     fn refill_earns_whole_requests_only() {
