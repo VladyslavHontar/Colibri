@@ -412,6 +412,9 @@ struct ColibriSink {
     /// Per slot, when transactions of its open batch went out, and how many:
     /// at the batch's end, how far ahead of it each went.
     sent_at: Mutex<HashMap<u64, Vec<(Instant, u32)>>>,
+    /// Per slot, the entries of its open batch read so far, for the entry
+    /// stream to send whole at the batch's end.
+    open_batch: Mutex<HashMap<u64, Vec<Entry>>>,
     entry_tx:      Arc<broadcast::Sender<ProtoEntry>>,
     tx_tx:         Arc<broadcast::Sender<ProtoTransaction>>,
     footer_tx:     Arc<broadcast::Sender<ProtoFooter>>,
@@ -429,9 +432,10 @@ impl ColibriSink {
     /// the batch that finished the slot (see `Entry.complete` in the proto).
     /// wincode is byte-compatible with bincode, so subscribers keep decoding
     /// the payload exactly as before.
-    /// `announced`: transactions at the front of the first entry that went
-    /// out already, ahead of it, and are not sent again.
-    fn publish(&self, slot: u64, entries: Vec<Entry>, complete: bool, announced: usize) {
+    /// One whole batch on the entry stream: its contract is one message per
+    /// batch, so batch boundaries can be recorded off it. Transactions go out
+    /// on their own stream as they are read (`emit_txs`).
+    fn publish(&self, slot: u64, entries: Vec<Entry>, complete: bool) {
         let bytes = match wincode::serialize(&entries) {
             Ok(b) => b,
             Err(e) => {
@@ -440,8 +444,6 @@ impl ColibriSink {
             }
         };
         let _ = self.entry_tx.send(ProtoEntry { slot, entries: bytes, complete });
-        let txs = entries.iter().enumerate().flat_map(|(k, e)| e.transactions.iter().skip(if k == 0 { announced } else { 0 }));
-        self.emit_txs(slot, txs, complete);
     }
 
     fn emit_txs<'a>(&self, slot: u64, txs: impl Iterator<Item = &'a VersionedTransaction>, complete: bool) {
@@ -535,7 +537,7 @@ impl BlockSink for ColibriSink {
     /// until we know whether completion follows it.
     fn on_events(&self, events: Vec<Event>) {
         let oracle_on = self.oracle.lock().map(|g| g.is_some()).unwrap_or(false);
-        let mut pending: Option<(u64, Vec<Entry>, usize)> = None;
+        let mut pending: Option<(u64, Vec<Entry>)> = None;
         let mut ahead_ms: Vec<(u64, u32)> = Vec::new();
         let mut published = 0u64;
         let mut footers = 0u64;
@@ -553,20 +555,27 @@ impl BlockSink for ColibriSink {
                             entries.iter().flat_map(|e| &e.transactions)
                                 .filter_map(|tx| tx.signatures.first()).map(|s| s.to_string()));
                     }
-                    if let Some((s, e, a)) = pending.replace((slot, entries, announced)) {
-                        self.publish(s, e, false, a);
-                        published += 1;
-                    }
+                    // Transactions now, those announced ahead of their entry aside;
+                    // the entries with their batch.
+                    let txs = entries.iter().enumerate().flat_map(|(k, e)| e.transactions.iter().skip(if k == 0 { announced } else { 0 }));
+                    self.emit_txs(slot, txs, false);
+                    let mut open = self.open_batch.lock().unwrap_or_else(|e| e.into_inner());
+                    // ponytail: leak guard, as for slot_sigs — a slot given up never ends its batch.
+                    if open.len() > 4_096 { open.clear(); }
+                    open.entry(slot).or_default().extend(entries);
                 }
                 Event::Transactions { slot, transactions } => {
                     self.read_txs(slot, transactions.len());
-                    if let Some((s, e, a)) = pending.take() {
-                        self.publish(s, e, false, a);
-                        published += 1;
-                    }
                     self.emit_txs(slot, transactions.iter(), false);
                 }
                 Event::BatchEnd { slot } => {
+                    let batch = self.open_batch.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot).unwrap_or_default();
+                    if !batch.is_empty() {
+                        if let Some((s, e)) = pending.replace((slot, batch)) {
+                            self.publish(s, e, false);
+                            published += 1;
+                        }
+                    }
                     // How far ahead of this moment each of the batch's transactions was read.
                     let now = Instant::now();
                     if let Some(sent) = self.sent_at.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot) {
@@ -587,11 +596,11 @@ impl BlockSink for ColibriSink {
                             }
                         }
                     }
-                    let (entries, announced) = match pending.take() {
-                        Some((s, e, a)) if s == slot => (e, a),
-                        other => { if let Some((s, e, a)) = other { self.publish(s, e, false, a); published += 1; } (Vec::new(), 0) }
+                    let entries = match pending.take() {
+                        Some((s, e)) if s == slot => e,
+                        other => { if let Some((s, e)) = other { self.publish(s, e, false); published += 1; } Vec::new() }
                     };
-                    self.publish(slot, entries, true, announced);
+                    self.publish(slot, entries, true);
                     published += 1;
                 }
                 Event::Footer { slot, bank_hash, producer_time_nanos } => {
@@ -611,12 +620,13 @@ impl BlockSink for ColibriSink {
                     // Which version is the block cannot be told from the shreds;
                     // repair finds no data for it and reports it skipped.
                     equivocated += 1;
+                    self.open_batch.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot);
                     eprintln!("[stream] slot {slot}: its leader sent two versions of the block; neither is streamed");
                 }
             }
         }
-        if let Some((s, e, a)) = pending.take() {
-            self.publish(s, e, false, a);
+        if let Some((s, e)) = pending.take() {
+            self.publish(s, e, false);
             published += 1;
         }
         let mut st = self.stats.lock().unwrap_or_else(|e| e.into_inner());
@@ -915,6 +925,7 @@ fn main() -> Result<()> {
         sv_cached:     AtomicU64::new(0),
         verified_roots: Mutex::new(HashSet::new()),
         sent_at:       Mutex::new(HashMap::new()),
+        open_batch:    Mutex::new(HashMap::new()),
         entry_tx,
         tx_tx,
         footer_tx,
