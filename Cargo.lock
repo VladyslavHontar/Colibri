@@ -1843,12 +1843,13 @@ dependencies = [
 [[package]]
 name = "deshredder"
 version = "0.2.0"
-source = "git+https://github.com/VladyslavHontar/Deshreder.git?rev=de36f11f2d82183f986a5da0afb66d7cd4d84e9f#de36f11f2d82183f986a5da0afb66d7cd4d84e9f"
+source = "git+https://github.com/VladyslavHontar/Deshreder.git?rev=d20a61e88eea772fdb5ba1fd2a2ead03b2cefd79#d20a61e88eea772fdb5ba1fd2a2ead03b2cefd79"
 dependencies = [
  "reed-solomon-erasure",
  "sha2 0.10.9",
  "solana-entry",
  "solana-hash",
+ "solana-transaction",
  "wincode",
 ]
 

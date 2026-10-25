@@ -24,7 +24,7 @@ mod sigverify;
 
 use {
     anyhow::Result,
-    deshredder::{Entry, Event},
+    deshredder::{Entry, Event, VersionedTransaction},
     serde_json::Value,
     server::{ProtoEntry, ProtoFooter, ProtoTransaction},
     shred_net::{BlockSink, ShredNet, ShredNetConfig},
@@ -381,6 +381,14 @@ struct Stats {
     published:  u64,
     /// Block footers seen — tells whether Alpenglow markers are live upstream.
     footers:    u64,
+    /// Since the last log line, how long after its leader made each block's
+    /// footer it was here, in ms: by the leader's clock against this host's.
+    behind_ms:  Vec<i64>,
+    /// Slots given up for holding two versions of their block.
+    equivocated: u64,
+    /// Since the last log line, how many ms ahead of its batch's end each
+    /// transaction went out, as (ms, transactions): 0 for one that waited.
+    ahead_ms:   Vec<(u64, u32)>,
 }
 
 /// Colibri's `BlockSink`: leader-keyed sigverify gate (fail-closed) and the
@@ -401,6 +409,9 @@ struct ColibriSink {
     /// signed once, so one ed25519 check admits the whole set, as agave's own
     /// cache does (`ledger/src/sigverify_shreds.rs`).
     verified_roots: Mutex<HashSet<([u8; 32], [u8; 64])>>,
+    /// Per slot, when transactions of its open batch went out, and how many:
+    /// at the batch's end, how far ahead of it each went.
+    sent_at: Mutex<HashMap<u64, Vec<(Instant, u32)>>>,
     entry_tx:      Arc<broadcast::Sender<ProtoEntry>>,
     tx_tx:         Arc<broadcast::Sender<ProtoTransaction>>,
     footer_tx:     Arc<broadcast::Sender<ProtoFooter>>,
@@ -418,7 +429,9 @@ impl ColibriSink {
     /// the batch that finished the slot (see `Entry.complete` in the proto).
     /// wincode is byte-compatible with bincode, so subscribers keep decoding
     /// the payload exactly as before.
-    fn publish(&self, slot: u64, entries: Vec<Entry>, complete: bool) {
+    /// `announced`: transactions at the front of the first entry that went
+    /// out already, ahead of it, and are not sent again.
+    fn publish(&self, slot: u64, entries: Vec<Entry>, complete: bool, announced: usize) {
         let bytes = match wincode::serialize(&entries) {
             Ok(b) => b,
             Err(e) => {
@@ -427,24 +440,33 @@ impl ColibriSink {
             }
         };
         let _ = self.entry_tx.send(ProtoEntry { slot, entries: bytes, complete });
-        self.emit_txs(slot, &entries, complete);
+        let txs = entries.iter().enumerate().flat_map(|(k, e)| e.transactions.iter().skip(if k == 0 { announced } else { 0 }));
+        self.emit_txs(slot, txs, complete);
     }
 
-    fn emit_txs(&self, slot: u64, entries: &[Entry], complete: bool) {
+    fn emit_txs<'a>(&self, slot: u64, txs: impl Iterator<Item = &'a VersionedTransaction>, complete: bool) {
         // Per-tx base58 + bincode is the most expensive work here; skip it
         // entirely when nothing consumes it.
         if self.tx_tx.receiver_count() == 0 {
             return;
         }
-        for entry in entries {
-            for tx in &entry.transactions {
-                let sig = tx.signatures.first().map(|s| s.to_string()).unwrap_or_default();
-                if let Ok(raw) = bincode::serialize(tx) {
-                    let _ = self.tx_tx.send(ProtoTransaction {
-                        slot, signature: sig, raw_tx: raw, complete,
-                    });
-                }
+        for tx in txs {
+            let sig = tx.signatures.first().map(|s| s.to_string()).unwrap_or_default();
+            if let Ok(raw) = bincode::serialize(tx) {
+                let _ = self.tx_tx.send(ProtoTransaction {
+                    slot, signature: sig, raw_tx: raw, complete,
+                });
             }
+        }
+    }
+
+    /// `n` transactions of `slot`'s open batch were read just now.
+    fn read_txs(&self, slot: u64, n: usize) {
+        if n > 0 {
+            let mut sent = self.sent_at.lock().unwrap_or_else(|e| e.into_inner());
+            // ponytail: leak guard, as for slot_sigs — a slot given up never ends its batch.
+            if sent.len() > 4_096 { sent.clear(); }
+            sent.entry(slot).or_default().push((Instant::now(), n as u32));
         }
     }
 }
@@ -513,12 +535,16 @@ impl BlockSink for ColibriSink {
     /// until we know whether completion follows it.
     fn on_events(&self, events: Vec<Event>) {
         let oracle_on = self.oracle.lock().map(|g| g.is_some()).unwrap_or(false);
-        let mut pending: Option<(u64, Vec<Entry>)> = None;
+        let mut pending: Option<(u64, Vec<Entry>, usize)> = None;
+        let mut ahead_ms: Vec<(u64, u32)> = Vec::new();
         let mut published = 0u64;
         let mut footers = 0u64;
+        let mut behind_ms: Vec<i64> = Vec::new();
+        let mut equivocated = 0u64;
         for ev in events {
             match ev {
-                Event::Entries { slot, entries } => {
+                Event::Entries { slot, entries, announced } => {
+                    self.read_txs(slot, entries.iter().map(|e| e.transactions.len()).sum::<usize>() - announced);
                     if oracle_on {
                         let mut m = self.slot_sigs.lock().unwrap_or_else(|e| e.into_inner());
                         // ponytail: leak guard — a slot that never completes stays here.
@@ -527,9 +553,24 @@ impl BlockSink for ColibriSink {
                             entries.iter().flat_map(|e| &e.transactions)
                                 .filter_map(|tx| tx.signatures.first()).map(|s| s.to_string()));
                     }
-                    if let Some((s, e)) = pending.replace((slot, entries)) {
-                        self.publish(s, e, false);
+                    if let Some((s, e, a)) = pending.replace((slot, entries, announced)) {
+                        self.publish(s, e, false, a);
                         published += 1;
+                    }
+                }
+                Event::Transactions { slot, transactions } => {
+                    self.read_txs(slot, transactions.len());
+                    if let Some((s, e, a)) = pending.take() {
+                        self.publish(s, e, false, a);
+                        published += 1;
+                    }
+                    self.emit_txs(slot, transactions.iter(), false);
+                }
+                Event::BatchEnd { slot } => {
+                    // How far ahead of this moment each of the batch's transactions was read.
+                    let now = Instant::now();
+                    if let Some(sent) = self.sent_at.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot) {
+                        ahead_ms.extend(sent.into_iter().map(|(t, n)| (now.duration_since(t).as_millis() as u64, n)));
                     }
                 }
                 Event::SlotComplete { slot } => {
@@ -546,15 +587,17 @@ impl BlockSink for ColibriSink {
                             }
                         }
                     }
-                    let entries = match pending.take() {
-                        Some((s, e)) if s == slot => e,
-                        other => { if let Some((s, e)) = other { self.publish(s, e, false); published += 1; } Vec::new() }
+                    let (entries, announced) = match pending.take() {
+                        Some((s, e, a)) if s == slot => (e, a),
+                        other => { if let Some((s, e, a)) = other { self.publish(s, e, false, a); published += 1; } (Vec::new(), 0) }
                     };
-                    self.publish(slot, entries, true);
+                    self.publish(slot, entries, true, announced);
                     published += 1;
                 }
                 Event::Footer { slot, bank_hash, producer_time_nanos } => {
                     footers += 1;
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
+                    behind_ms.push((now - producer_time_nanos as i64) / 1_000_000);
                     let _ = self.footer_tx.send(ProtoFooter {
                         slot,
                         bank_hash: bank_hash.to_bytes().to_vec(),
@@ -564,29 +607,58 @@ impl BlockSink for ColibriSink {
                 Event::UndecodableBatch { slot, first_index, last_index } => {
                     eprintln!("[stream] slot {slot}: shreds {first_index}..={last_index} did not decode as a BlockComponent");
                 }
+                Event::Equivocated { slot } => {
+                    // Which version is the block cannot be told from the shreds;
+                    // repair finds no data for it and reports it skipped.
+                    equivocated += 1;
+                    eprintln!("[stream] slot {slot}: its leader sent two versions of the block; neither is streamed");
+                }
             }
         }
-        if let Some((s, e)) = pending.take() {
-            self.publish(s, e, false);
+        if let Some((s, e, a)) = pending.take() {
+            self.publish(s, e, false, a);
             published += 1;
         }
         let mut st = self.stats.lock().unwrap_or_else(|e| e.into_inner());
         st.published += published;
         st.footers += footers;
+        st.behind_ms.extend(behind_ms);
+        st.ahead_ms.extend(ahead_ms);
+        st.equivocated += equivocated;
         if st.last_log.elapsed() >= Duration::from_secs(10) {
+            st.behind_ms.sort_unstable();
+            let at = |q: f64| st.behind_ms.get(((st.behind_ms.len().max(1) - 1) as f64 * q) as usize).copied();
+            let (p10, p50, p90) = (at(0.1), at(0.5), at(0.9));
+            // Transactions ahead of their batch's end, weighted by count.
+            st.ahead_ms.sort_unstable();
+            let total: u64 = st.ahead_ms.iter().map(|(_, n)| u64::from(*n)).sum();
+            let ahead = |q: f64| {
+                let mut left = (total as f64 * q) as u64;
+                st.ahead_ms.iter().find(|(_, n)| { let n = u64::from(*n); if left < n { true } else { left -= n; false } }).map(|(ms, _)| *ms)
+            };
+            let early_share = if total > 0 { 100.0 * st.ahead_ms.iter().filter(|(ms, _)| *ms >= 1).map(|(_, n)| f64::from(*n)).sum::<f64>() / total as f64 } else { 0.0 };
             eprintln!(
-                "[stream] admitted={} published={} footers={} tip={} \
+                "[stream] admitted={} published={} footers={} tip={} equivocated={} \
+                 behind_leader_ms[p10={p10:?} p50={p50:?} p90={p90:?}] \
+                 txs_ahead_of_batch_end[{total} txs, {early_share:.0}% >=1ms, p50={:?} p90={:?} p99={:?} max={:?} ms] \
                  sigverify[ok={} by_known_root={} rejected={} dropped_no_leader={}]",
                 st.admitted,
                 st.published,
                 st.footers,
                 self.tip.load(Ordering::Relaxed),
+                st.equivocated,
+                ahead(0.5),
+                ahead(0.9),
+                ahead(0.99),
+                st.ahead_ms.last().map(|(ms, _)| *ms),
                 self.sv_verified.load(Ordering::Relaxed),
                 self.sv_cached.load(Ordering::Relaxed),
                 self.sv_rejected.load(Ordering::Relaxed),
                 self.sv_no_leader.load(Ordering::Relaxed),
             );
             st.last_log = Instant::now();
+            st.behind_ms.clear();
+            st.ahead_ms.clear();
         }
     }
 
@@ -832,6 +904,9 @@ fn main() -> Result<()> {
             admitted:   0,
             published:  0,
             footers:    0,
+            behind_ms:  Vec::new(),
+            equivocated: 0,
+            ahead_ms:   Vec::new(),
         }),
         leader_sched:  leader_sched.clone(),
         sv_verified:   AtomicU64::new(0),
@@ -839,6 +914,7 @@ fn main() -> Result<()> {
         sv_no_leader:  AtomicU64::new(0),
         sv_cached:     AtomicU64::new(0),
         verified_roots: Mutex::new(HashSet::new()),
+        sent_at:       Mutex::new(HashMap::new()),
         entry_tx,
         tx_tx,
         footer_tx,
