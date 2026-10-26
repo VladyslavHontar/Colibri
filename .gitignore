@@ -1,7 +1,9 @@
-/.env
+/target/
 .DS_Store
 .idea/
-/target/
-# per-machine runtime config (copy colibri.example.json)
+.claude/
+# per-machine runtime state: config, gossip identity, auth token, docker env
+/.env
+/colibri-data/
 colibri.json
 colibri-identity.json
