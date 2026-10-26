@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Deshredder — the standalone shred→entries assembly library (fast lane).
-deshredder = { git = "https://github.com/VladyslavHontar/Deshreder.git", rev = "d20a61e88eea772fdb5ba1fd2a2ead03b2cefd79" }
+deshredder = { git = "https://github.com/VladyslavHontar/Deshreder.git", rev = "15e3fc4ed0e0bc9572e742817de81e2709a7c97e" }
 
 # The P2P complete lane: gossip join + repair protocol + Blockstore
 # reconstruction (workspace member).
