@@ -854,8 +854,8 @@ fn spawn_dispatch(
                     eprintln!(
                         "[coverage] {sets:.0} FEC sets, of 64 shreds each from turbine: p10={p10:.0} p50={p50:.0} p90={p90:.0}; \
                          {recoverable:.1}% rebuildable without repair | leaders skipped for repair={} conflicts={} \
-                         entries streamed before their batch was whole={}",
-                        busy.len(), reconstructor.conflicts(), reconstructor.early_entries(),
+                         off_spec={} entries streamed before their batch was whole={}",
+                        busy.len(), reconstructor.conflicts(), reconstructor.off_spec(), reconstructor.early_entries(),
                     );
                 }
                 last_diag = Instant::now();

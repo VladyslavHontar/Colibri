@@ -79,6 +79,11 @@ impl Reconstructor {
         self.lock().conflicts()
     }
 
+    /// Shreds seen off SIMD-0504's shape (32 data and 32 coding to a set, each in its place).
+    pub fn off_spec(&self) -> u64 {
+        self.lock().off_spec()
+    }
+
     /// Entries streamed before the batch they are in was whole.
     pub fn early_entries(&self) -> u64 {
         self.lock().early_entries()
