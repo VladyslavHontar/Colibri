@@ -2,6 +2,15 @@
 
 Solana shred-to-transaction node. Joins gossip as a plain (non-staked) peer, receives shreds from Turbine, repairs the gaps, and streams the assembled transactions, entries and Alpenglow block footers over gRPC. Shred assembly lives in [Deshreder](https://github.com/VladyslavHontar/Deshreder); everything network-side lives here.
 
+## What it is for
+
+Seeing transactions as the leader sends them, without a validator's stake, a paid shred feed or a full node's disk and CPU. It runs on one small machine, even behind a home NAT.
+
+- **Use it** to develop and test anything that reacts to live transactions, to measure how far behind the leader a plain node sits, or to study how blocks look on the wire under Alpenglow (no vote transactions, block footers, FEC sets).
+- **Do not expect** the speed of a staked validator or of a paid shred stream: an unstaked peer sits at the edge of the Turbine tree and gets part of each block from it, the rest by repair.
+
+Measured on mainnet, unstaked, over a home link (October 2026): a median 40 of each FEC set's 64 shreds came from Turbine and 99.0% of sets rebuilt without repair; transactions arrived a median ~170 ms (p90 ~300 ms) behind the leader's own timestamp in the block footer (so your clock must be in sync). The `[coverage]` and `behind_leader_ms` log lines print these for your own host.
+
 ## Quick start
 
 The easiest way is Docker. Nothing to configure:
@@ -96,3 +105,7 @@ Proto: [`colibri/protos/shredstream.proto`](colibri/protos/shredstream.proto). T
 ## Coverage
 
 A non-staked peer sits at the edge of the Turbine tree and receives only part of every block from turbine; repair fills the rest, so complete slots arrive later than on a staked node. Coverage depends on how many peers accept repair requests from you and on your position in the tree.
+
+## License
+
+MIT, see [LICENSE](LICENSE). `vendor/solana-gossip` is a patched copy of agave's crate and stays under agave's Apache-2.0 license (its own `LICENSE`).
