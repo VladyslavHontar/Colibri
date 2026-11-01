@@ -30,6 +30,11 @@ tonic = { version = "0.12", features = ["tls"] }
 # `--rpc https://…` works; the TLS stack is shared with tonic's `tls` feature.
 ureq = { version = "3", features = ["rustls"] }
 prost = "0.13"
+# Leader schedule from stakes: agave v4.3.0's private stake_weighted_slot_leaders is copied
+# (leader-schedule/src/lib.rs); these are the crates it samples with.
+agave-random         = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0", features = ["agave-unstable-api"] }
+solana-leader-schedule = { git = "https://github.com/anza-xyz/agave.git", tag = "v4.3.0", features = ["agave-unstable-api"] }
+rand_chacha          = "0.9"
 # agave 4.3.0 serialises `Entry` with wincode, not serde. Byte-compatible with
 # bincode, so the emitted gRPC payload is unchanged for subscribers.
 wincode = "0.6.1"

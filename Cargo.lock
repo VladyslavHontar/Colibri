@@ -1406,14 +1406,17 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 name = "colibri"
 version = "0.1.0"
 dependencies = [
+ "agave-random",
  "anyhow",
  "bincode",
  "deshredder",
  "env_logger",
  "prost 0.13.5",
+ "rand_chacha 0.9.0",
  "serde_json",
  "shred-net",
  "solana-keypair",
+ "solana-leader-schedule",
  "solana-pubkey 4.3.0",
  "solana-signature",
  "solana-signer",
