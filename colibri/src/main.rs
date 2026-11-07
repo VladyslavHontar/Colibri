@@ -18,6 +18,7 @@
 #![allow(deprecated)]
 
 mod coverage;
+mod leader_schedule;
 mod oracle;
 mod server;
 mod sigverify;
