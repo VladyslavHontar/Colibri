@@ -519,10 +519,10 @@ impl Asker<'_> {
     }
 }
 
-/// How long a pick of repair peers is used. Reading gossip copies every
-/// contact it holds, thousands of them, and was done on every 10 ms pass; who
-/// the peers are and who leads moves by the slot, not by the pass.
-const PEERS_FOR: Duration = Duration::from_millis(400);
+/// How often gossip is read for repair peers: as often as gossip itself
+/// runs, since its table holds nothing new in between. A read copies every
+/// contact held, thousands of them, and was done on every 10 ms pass.
+const GOSSIP_READ: Duration = Duration::from_millis(solana_gossip::cluster_info::GOSSIP_SLEEP_MILLIS);
 
 fn spawn_dispatch(
     cfg: &ShredNetConfig,
@@ -559,11 +559,14 @@ fn spawn_dispatch(
         let (sink, diag) = (&shared.sink, &shared.diag);
         let mut asker = Asker { sock: &repair_sock, keypair: &keypair, diag, nonce: 0xdead_beef };
         let mut rng: u64 = now_millis() | 1;
-        // The repair peers, the stake each is drawn by, how many leaders were
-        // left out, and when they were picked.
+        // The best repair peers gossip holds, with the stake each is drawn by,
+        // and when gossip was read; of them, those not leading now, and the
+        // leaders they were picked against.
+        let mut scored: Vec<(([u8; 32], SocketAddr), u64)> = Vec::new();
+        let mut scored_at = None::<Instant>;
         let mut peers: Vec<([u8; 32], SocketAddr)> = Vec::new();
         let mut weights: Vec<u64> = Vec::new();
-        let (mut busy, mut peers_at) = (0, None::<Instant>);
+        let mut leading: Option<Vec<[u8; 32]>> = None;
         let mut last_purge = Instant::now();
         let mut last_diag = Instant::now();
         // Requests that may go out now; `None` is no limit. A token bucket
@@ -591,17 +594,23 @@ fn spawn_dispatch(
             }
 
             // ── select peers ──
-            if peers_at.is_none_or(|at| at.elapsed() >= PEERS_FOR) {
+            if scored_at.is_none_or(|at| at.elapsed() >= GOSSIP_READ) {
                 let stakes = shared.stakes.lock().unwrap_or_else(|e| e.into_inner());
-                peers = gossip::repair_peers(&cluster_info, &stakes, now_millis(), top_peers);
-                let leading = sink.leaders_near(shared.observed_tip.load(Ordering::Relaxed));
-                busy = leading.len();
-                peers.retain(|(pk, _)| !leading.contains(pk));
-                // Each request goes to a peer drawn by stake, as agave's own repair
-                // draws them: a staked node answers more, and no peer is asked in turn.
-                weights = peers.iter().map(|(pk, _)| stakes.get(pk).copied().unwrap_or(0)).collect();
-                peers_at = Some(Instant::now());
+                scored = gossip::repair_peers(&cluster_info, &stakes, now_millis(), top_peers).into_iter()
+                    .map(|peer| (peer, stakes.get(&peer.0).copied().unwrap_or(0)))
+                    .collect();
+                (scored_at, leading) = (Some(Instant::now()), None);
             }
+            // Who leads is asked on every pass: it moves with the slot, however
+            // long a slot is, and the pick is redone only when it has moved.
+            // Each request goes to a peer drawn by stake, as agave's own repair
+            // draws them: a staked node answers more, and no peer is asked in turn.
+            let now_leading = sink.leaders_near(shared.observed_tip.load(Ordering::Relaxed));
+            if leading.as_ref() != Some(&now_leading) {
+                (peers, weights) = scored.iter().filter(|(peer, _)| !now_leading.contains(&peer.0)).copied().unzip();
+                leading = Some(now_leading);
+            }
+            let busy = leading.as_ref().map_or(0, Vec::len);
 
             if let (Some(left), Some(rate)) = (budget.as_mut(), repair_rate)
                 && let Some(add) = refill(rate, budget_since.elapsed()) {
