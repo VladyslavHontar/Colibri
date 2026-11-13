@@ -143,7 +143,9 @@ pub struct ColibriSink {
 impl ColibriSink {
     pub fn new(
         leader_sched: Arc<Mutex<sigverify::LeaderScheduleCache>>,
-        (entry_tx, tx_tx, footer_tx): (Arc<broadcast::Sender<ProtoEntry>>, Arc<broadcast::Sender<ProtoTransaction>>, Arc<broadcast::Sender<ProtoFooter>>),
+        entry_tx: Arc<broadcast::Sender<ProtoEntry>>,
+        tx_tx: Arc<broadcast::Sender<ProtoTransaction>>,
+        footer_tx: Arc<broadcast::Sender<ProtoFooter>>,
         meter: Arc<Mutex<coverage::CoverageMeter>>,
         oracle: Arc<Mutex<Option<oracle::OracleSampler>>>,
     ) -> Self {

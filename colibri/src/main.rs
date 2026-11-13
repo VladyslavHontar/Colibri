@@ -15,7 +15,6 @@
 //! is not emitted, never reaches the assembler, and does not advance the
 //! observed tip.
 
-#![allow(deprecated)]
 
 mod config;
 mod coverage;
@@ -277,7 +276,7 @@ fn main() -> Result<()> {
             oracle::OracleSampler::new(url.clone())
         })));
 
-    let sink = Arc::new(sink::ColibriSink::new(leader_sched, (entry_tx, tx_tx, footer_tx), meter.clone(), oracle_sampler.clone()));
+    let sink = Arc::new(sink::ColibriSink::new(leader_sched, entry_tx, tx_tx, footer_tx, meter.clone(), oracle_sampler.clone()));
 
     // ── start the shred network (gossip + TVU + repair + reconstruction) ─────
     let net = ShredNet::start(
