@@ -28,7 +28,7 @@ use {
     anyhow::Result,
     serde_json::Value,
     server::{ProtoEntry, ProtoFooter, ProtoTransaction},
-    shred_net::{ShredNet, ShredNetConfig},
+    shred_net::{ShredNet, ShredNetConfig, DISPATCH_PASS},
     solana_keypair::{read_keypair_file, write_keypair_file, Keypair},
     solana_pubkey::Pubkey,
     solana_signer::Signer,
@@ -351,7 +351,7 @@ fn main() -> Result<()> {
         }
         let tip = net.observed_tip();
         if tip == 0 {
-            sleep(Duration::from_millis(250));
+            sleep(DISPATCH_PASS);
             continue;
         }
 
@@ -380,7 +380,10 @@ fn main() -> Result<()> {
             target(last_req + 1, tip - 1);
             last_req = tip - 1;
         }
-        sleep(Duration::from_millis(400));
+        // The tip is followed at the pace the repair driver takes slots up
+        // at: a pause written as a slot's length left a new slot unasked for
+        // about two slots once a slot was no longer 400 ms.
+        sleep(DISPATCH_PASS);
     }
 
     report(&meter, &sink, &oracle_sampler, start.elapsed());

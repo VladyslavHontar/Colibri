@@ -44,6 +44,11 @@ use {
     },
 };
 
+/// How often the repair driver takes up newly asked slots, picks what each
+/// slot in flight needs and sends it. Whoever asks for slots gains nothing by
+/// asking more often than this.
+pub const DISPATCH_PASS: Duration = Duration::from_millis(10);
+
 /// Max shreds coalesced into a single `insert_batch` (one assembler lock) call.
 const MAX_BATCH: usize = 1024;
 /// Bounded insert-channel capacity. Full ⇒ insert worker is the bottleneck.
@@ -818,7 +823,7 @@ fn spawn_dispatch(
                 last_diag = Instant::now();
             }
 
-            sleep(Duration::from_millis(10));
+            sleep(DISPATCH_PASS);
         }
     })
 }
