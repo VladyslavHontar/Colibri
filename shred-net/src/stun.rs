@@ -22,7 +22,7 @@ use {
             Arc,
         },
         thread::{sleep, JoinHandle},
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
 };
 
@@ -34,6 +34,8 @@ const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_INDICATION: u16 = 0x0011;
 const XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const ATTEMPTS: usize = 3;
+/// How long one attempt waits for the server's reply.
+const WAIT: Duration = Duration::from_secs(2);
 
 /// Re-probe well inside the shortest UDP mapping timeouts seen in the wild
 /// (consumer routers commonly expire at 30s).
@@ -96,7 +98,7 @@ pub fn external_addr(sock: &UdpSocket, server: &str) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("STUN server {server} has no IPv4 address"))?;
 
     let prev_timeout = sock.read_timeout().ok().flatten();
-    sock.set_read_timeout(Some(Duration::from_secs(2)))?;
+    sock.set_read_timeout(Some(WAIT))?;
 
     let mut result = Err(anyhow!("STUN server {server} did not answer"));
     let mut buf = [0u8; 1024];
@@ -106,8 +108,13 @@ pub fn external_addr(sock: &UdpSocket, server: &str) -> Result<SocketAddr> {
             continue;
         }
         // Drain until our own reply shows up: on a live socket other traffic
-        // (or a stale STUN answer) can be queued ahead of it.
-        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+        // (or a stale STUN answer) can be queued ahead of it. By the clock,
+        // not until the socket falls silent: a node started again while
+        // turbine still sends to its old mapping never sees silence, and one
+        // lost reply held it here for good.
+        let deadline = Instant::now() + WAIT;
+        while Instant::now() < deadline {
+            let Ok((n, from)) = sock.recv_from(&mut buf) else { break };
             if from == server_addr
                 && let Some(addr) = parse_response(&buf[..n], &txid)
             {
