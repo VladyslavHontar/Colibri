@@ -164,7 +164,7 @@ impl OracleSampler {
     /// `fetch_errors` instead so the report stays honest.
     pub fn on_complete(&mut self, slot: u64, sigs: &HashSet<String>) {
         self.completion_count += 1;
-        if self.completion_count % self.sample_every != 0 {
+        if !self.completion_count.is_multiple_of(self.sample_every) {
             return;
         }
 

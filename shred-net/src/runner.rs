@@ -5,16 +5,15 @@
 //! Threading (all `std::thread`, no imposed async runtime — Colibri embeds
 //! this). The ingest path is decoupled from dispatch so a slow
 //! assembly never stalls socket draining or request pacing:
-//!   - gossip threads (owned by `GossipService`)
-//!   - TVU recv      — recv turbine shreds → insert channel + fast-lane hook
-//!   - repair recv   — recv repair socket: ping→pong inline, shred→insert channel
-//!                     (no assembly on this thread, so it drains continuously and
-//!                     never drops bursts)
-//!   - insert worker — drain the channel and `insert_batch` into the assembler,
-//!                     amortizing its lock over up to MAX_BATCH
-//!                     shreds per call (the throughput lever)
-//!   - dispatch      — timer-paced: admit targets, pick peers, send repair
-//!                     requests, emit completed blocks, prune
+//! - gossip threads, owned by `GossipService`;
+//! - TVU recv: turbine shreds to the insert channel and the fast-lane hook;
+//! - repair recv: the repair socket, a ping answered inline and a shred sent
+//!   to the insert channel (no assembly on this thread, so it drains
+//!   continuously and never drops bursts);
+//! - insert worker: drains the channel and `insert_batch`es into the
+//!   assembler, one lock for up to MAX_BATCH shreds (the throughput lever);
+//! - dispatch, timer-paced: admits targets, picks peers, sends repair
+//!   requests, emits completed blocks, prunes.
 //!
 //! The channel is BOUNDED: if the insert worker can't keep up, sends fail and
 //! bump `chan_drop` — a direct signal that the bottleneck is the insert path,
@@ -499,8 +498,9 @@ fn spawn_repair_recv(
             if exit.load(Ordering::Relaxed) {
                 break;
             }
-            match repair_sock.recv_from(&mut buf) {
-                Ok((n, src)) => match wire::parse_inbound(&buf[..n]) {
+            // An error is WouldBlock or TimedOut on the read timeout: nothing came.
+            if let Ok((n, src)) = repair_sock.recv_from(&mut buf) {
+                match wire::parse_inbound(&buf[..n]) {
                     wire::Inbound::Ping(token) => {
                         diag.pings.fetch_add(1, Ordering::Relaxed);
                         let pong = wire::build_pong(&keypair, token);
@@ -519,8 +519,7 @@ fn spawn_repair_recv(
                         }
                     }
                     wire::Inbound::Other => {}
-                },
-                Err(_) => {} // WouldBlock/TimedOut on the 5ms read timeout
+                }
             }
         }
     })
@@ -643,12 +642,11 @@ fn spawn_dispatch(
             // draws them: a staked node answers more, and no peer is asked in turn.
             let weights: Vec<u64> = peers.iter().map(|(pk, _)| stake_map.get(pk).copied().unwrap_or(0)).collect();
 
-            if let (Some(left), Some(rate)) = (budget.as_mut(), repair_rate) {
-                if let Some(add) = refill(rate, budget_since.elapsed()) {
+            if let (Some(left), Some(rate)) = (budget.as_mut(), repair_rate)
+                && let Some(add) = refill(rate, budget_since.elapsed()) {
                     *left = (*left + add).min(rate * BUDGET_BURST.as_millis() as u64 / 1000);
                     budget_since = Instant::now();
                 }
-            }
 
             // ── per-slot repair dispatch ──
             if !peers.is_empty() {

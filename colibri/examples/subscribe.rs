@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if last_report.elapsed().as_secs() >= 5 {
             let elapsed = start.elapsed().as_secs();
-            let tps = if elapsed > 0 { total_txs / elapsed } else { 0 };
+            let tps = total_txs.checked_div(elapsed).unwrap_or(0);
             eprintln!("[subscribe] t={}s  txs={}  (~{} tx/s)", elapsed, total_txs, tps);
             last_report = Instant::now();
         }

@@ -122,7 +122,7 @@ pub fn build_pong(keypair: &Keypair, token: [u8; 32]) -> Vec<u8> {
     // hash = SHA-256("SOLANA_PING_PONG" ++ token)
     let mut hasher = Sha256::new();
     hasher.update(b"SOLANA_PING_PONG");
-    hasher.update(&token);
+    hasher.update(token);
     let hash_bytes: [u8; 32] = hasher.finalize().into();
 
     // signature = sign(hash_bytes)

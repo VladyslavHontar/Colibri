@@ -273,55 +273,30 @@ pub(crate) fn rpc_post(url: &str, body: &str) -> Option<String> {
         .ok()
 }
 
-/// Fetch the top-`fanout` validators by activated stake: (stake, node pubkey).
-/// Fed to shred-net's repair-peer scoring via `set_stakes`.
+/// The `fanout` validators with the most activated stake, as (stake, node
+/// identity): what repair weighs its peers by (`ShredNet::set_stakes`). Empty
+/// when the node does not answer; the caller keeps what it had.
 fn fetch_tier1(rpc_url: &str, fanout: usize) -> Vec<(u64, [u8; 32])> {
     let body = r#"{"jsonrpc":"2.0","id":1,"method":"getVoteAccounts","params":[{"commitment":"finalized"}]}"#;
-
-    let resp = match rpc_post(rpc_url, body) {
-        Some(r) => r,
-        None => {
-            eprintln!("[tier1] HTTP request to {rpc_url} failed");
-            return Vec::new();
-        }
+    let Some(response) = rpc_post(rpc_url, body) else {
+        eprintln!("[tier1] HTTP request to {rpc_url} failed");
+        return Vec::new();
     };
-
-    let v: Value = match serde_json::from_str(&resp) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[tier1] JSON parse error: {e}");
-            return Vec::new();
-        }
+    let v: Value = serde_json::from_str(&response).unwrap_or_default();
+    let Some(current) = v["result"]["current"].as_array() else {
+        eprintln!("[tier1] unexpected RPC response shape");
+        return Vec::new();
     };
-
-    let current = match v["result"]["current"].as_array() {
-        Some(arr) => arr,
-        None => {
-            eprintln!("[tier1] unexpected RPC response shape");
-            return Vec::new();
-        }
-    };
-
-    let mut validators: Vec<(u64, [u8; 32])> = current
-        .iter()
-        .filter_map(|entry| {
-            let pubkey_str = entry["nodePubkey"].as_str()?;
-            let stake: u64 = if let Some(n) = entry["activatedStake"].as_u64() {
-                n
-            } else if let Some(s) = entry["activatedStake"].as_str() {
-                s.parse().ok()?
-            } else {
-                return None;
-            };
-            let arr: [u8; 32] = Pubkey::from_str(pubkey_str).ok()?.to_bytes();
-            Some((stake, arr))
-        })
-        .collect();
-
-    validators.sort_by(|a, b| b.0.cmp(&a.0));
-    let result: Vec<(u64, [u8; 32])> = validators.into_iter().take(fanout).collect();
-    eprintln!("[tier1] fetched {} validators (fanout={fanout})", result.len());
-    result
+    let mut validators: Vec<(u64, [u8; 32])> = current.iter().filter_map(|entry| {
+        // The stake is a number on most nodes and a string on some.
+        let stake = &entry["activatedStake"];
+        let stake = stake.as_u64().or_else(|| stake.as_str()?.parse().ok())?;
+        Some((stake, Pubkey::from_str(entry["nodePubkey"].as_str()?).ok()?.to_bytes()))
+    }).collect();
+    validators.sort_unstable_by_key(|v| std::cmp::Reverse(v.0));
+    validators.truncate(fanout);
+    eprintln!("[tier1] fetched {} validators (fanout={fanout})", validators.len());
+    validators
 }
 
 /// Slot of a raw shred (LE u64 at offset 65), gated on the shred-variant byte
@@ -341,35 +316,6 @@ fn shred_slot(buf: &[u8]) -> Option<u64> {
         return None;
     }
     Some(u64::from_le_bytes(buf[65..73].try_into().ok()?))
-}
-
-#[cfg(test)]
-mod shred_slot_tests {
-    use super::*;
-
-    #[test]
-    fn parses_slot_of_merkle_data_shred() {
-        let mut buf = [0u8; 88];
-        buf[64] = 0x80; // ShredVariant::MerkleData
-        buf[65..73].copy_from_slice(&123u64.to_le_bytes());
-        assert_eq!(shred_slot(&buf), Some(123));
-    }
-
-    #[test]
-    fn parses_slot_of_merkle_coding_shred() {
-        let mut buf = [0u8; 89];
-        buf[64] = 0x66; // chained Merkle code, proof_size 6
-        buf[65..73].copy_from_slice(&456u64.to_le_bytes());
-        assert_eq!(shred_slot(&buf), Some(456));
-    }
-
-    #[test]
-    fn rejects_non_shred_and_short_packets() {
-        let mut buf = [0u8; 88];
-        buf[64] = 0x00; // not a shred variant
-        assert_eq!(shred_slot(&buf), None);
-        assert_eq!(shred_slot(&[0u8; 40]), None);
-    }
 }
 
 // ─── the sink: sigverify gate + gRPC fan-out of assembler events ─────────────
@@ -482,11 +428,12 @@ impl BlockSink for ColibriSink {
         leaders
     }
 
-    /// Sigverify gate. Fail-closed for BOTH branches (agave-faithful):
-    ///   * leader known  → verify signature over the Merkle root; DROP on
-    ///                     failure.
-    ///   * leader unknown → DROP; the lookup records the epoch so the
-    ///                     background thread fetches its schedule on demand.
+    /// Sigverify gate, fail-closed either way, as agave's is:
+    /// - leader known: its signature over the Merkle root is verified, and a
+    ///   shred that fails is dropped;
+    /// - leader unknown: the shred is dropped, and the lookup records the
+    ///   epoch so the background thread fetches its schedule.
+    ///
     /// Returning `false` keeps the shred out of the assembler (hence the gRPC
     /// stream) and keeps it from advancing the observed tip.
     fn on_raw_shred(&self, bytes: &[u8]) -> bool {
@@ -571,12 +518,11 @@ impl BlockSink for ColibriSink {
                 }
                 Event::BatchEnd { slot } => {
                     let batch = self.open_batch.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot).unwrap_or_default();
-                    if !batch.is_empty() {
-                        if let Some((s, e)) = pending.replace((slot, batch)) {
+                    if !batch.is_empty()
+                        && let Some((s, e)) = pending.replace((slot, batch)) {
                             self.publish(s, e, false);
                             published += 1;
                         }
-                    }
                     // How far ahead of this moment each of the batch's transactions was read.
                     let now = Instant::now();
                     if let Some(sent) = self.sent_at.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot) {
@@ -591,11 +537,10 @@ impl BlockSink for ColibriSink {
                     if oracle_on {
                         let sigs = self.slot_sigs.lock().unwrap_or_else(|e| e.into_inner())
                             .remove(&slot).unwrap_or_default();
-                        if let Ok(mut guard) = self.oracle.lock() {
-                            if let Some(sampler) = guard.as_mut() {
+                        if let Ok(mut guard) = self.oracle.lock()
+                            && let Some(sampler) = guard.as_mut() {
                                 sampler.on_complete(slot, &sigs);
                             }
-                        }
                     }
                     let entries = match pending.take() {
                         Some((s, e)) if s == slot => e,
@@ -782,8 +727,7 @@ fn main() -> Result<()> {
                 footers: footer_tx.clone(),
             },
             cfg.auth_token.clone(),
-            cfg.tls_cert.clone(),
-            cfg.tls_key.clone(),
+            cfg.tls_cert.clone().zip(cfg.tls_key.clone()),
             requested_from.clone(),
             exit.clone(),
         )
@@ -795,109 +739,10 @@ fn main() -> Result<()> {
         eprintln!("[colibri] TLS:            disabled (plain gRPC)");
     }
 
-    // ── shred sigverify: leader schedule cache + background fetcher ──────────
+    // ── shred sigverify: the leader schedule, kept loaded in the background ──
     let leader_sched: Arc<Mutex<sigverify::LeaderScheduleCache>> =
         Arc::new(Mutex::new(sigverify::LeaderScheduleCache::new()));
-
-    // Leader-schedule background thread: bootstrap epoch math + current epoch,
-    // then service on-demand per-epoch fetch requests. ALL blocking RPCs happen
-    // OUTSIDE the cache lock (fetch → then install under a brief lock) so the
-    // per-shred ingest lookup never blocks on a network round-trip.
-    //
-    // Fail-closed startup: the money path drops every shred until epoch math AND
-    // the current-epoch schedule are loaded (leader_for_slot → None until then).
-    // Epoch rollover: a tip shred whose (new) epoch is not loaded is dropped and
-    // its epoch is queued in `pending`; this loop drains `pending` every ~500ms,
-    // so the blind window at a boundary is sub-second.
-    {
-        let sched_bg   = leader_sched.clone();
-        let rpc_url_bg = cfg.rpc_url.clone();
-        let exit_bg    = exit.clone();
-        std::thread::spawn(move || {
-            // Force the current-epoch preload on the first iteration.
-            let mut last_current_check = Instant::now() - Duration::from_secs(3600);
-            loop {
-                if exit_bg.load(Ordering::Relaxed) { return; }
-
-                // ── (1) bootstrap epoch math (getEpochSchedule), once ────────
-                let math = sched_bg.lock().unwrap_or_else(|e| e.into_inner()).math();
-                let math = match math {
-                    Some(m) => m,
-                    None => match sigverify::fetch_epoch_math(&rpc_url_bg) {
-                        Some(m) => {
-                            sched_bg.lock().unwrap_or_else(|e| e.into_inner()).install_math(m);
-                            eprintln!("[sigverify] epoch math loaded: {m:?}");
-                            m
-                        }
-                        None => {
-                            eprintln!("[sigverify] getEpochSchedule failed; retrying in 1s");
-                            for _ in 0..5 {
-                                if exit_bg.load(Ordering::Relaxed) { return; }
-                                sleep(Duration::from_millis(200));
-                            }
-                            continue;
-                        }
-                    },
-                };
-
-                // ── (2) ensure current epoch loaded (startup + rollover heal) ─
-                if last_current_check.elapsed() >= Duration::from_secs(10) {
-                    last_current_check = Instant::now();
-                    if let Some(abs) = sigverify::fetch_absolute_slot(&rpc_url_bg) {
-                        if let Some(cur_epoch) = math.epoch_of(abs) {
-                            let need = !sched_bg.lock().unwrap_or_else(|e| e.into_inner())
-                                .has_epoch(cur_epoch);
-                            if need {
-                                if let Some((fs, es, leaders)) =
-                                    sigverify::fetch_epoch_leaders(&rpc_url_bg, cur_epoch, &math)
-                                {
-                                    let mut g = sched_bg.lock().unwrap_or_else(|e| e.into_inner());
-                                    g.install_epoch(cur_epoch, fs, es, leaders);
-                                    let (a, b) = g.loaded_range();
-                                    drop(g);
-                                    eprintln!(
-                                        "[sigverify] current epoch {cur_epoch} loaded; \
-                                         active schedule covers slots [{a}, {b})"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // ── (3) service on-demand pending epochs (fetch OUTSIDE lock) ─
-                let pending = sched_bg.lock().unwrap_or_else(|e| e.into_inner()).take_pending();
-                for epoch in pending {
-                    if exit_bg.load(Ordering::Relaxed) { return; }
-                    if sched_bg.lock().unwrap_or_else(|e| e.into_inner()).has_epoch(epoch) {
-                        continue; // already loaded via another path
-                    }
-                    match sigverify::fetch_epoch_leaders(&rpc_url_bg, epoch, &math) {
-                        Some((fs, es, leaders)) => {
-                            let mut g = sched_bg.lock().unwrap_or_else(|e| e.into_inner());
-                            g.install_epoch(epoch, fs, es, leaders);
-                            drop(g);
-                            eprintln!("[sigverify] on-demand epoch {epoch} loaded [{fs}, {es})");
-                        }
-                        None => {
-                            // RPC has no schedule for this epoch (deep historical):
-                            // stay fail-closed — its shreds keep being dropped. A
-                            // fresh ingest miss re-queues it if it becomes relevant.
-                            eprintln!(
-                                "[sigverify] on-demand epoch {epoch} unavailable — \
-                                 shreds for it stay DROPPED (fail-closed)"
-                            );
-                        }
-                    }
-                }
-
-                for _ in 0..5 {
-                    if exit_bg.load(Ordering::Relaxed) { return; }
-                    sleep(Duration::from_millis(100));
-                }
-            }
-        });
-    }
+    sigverify::spawn_schedule_fetcher(leader_sched.clone(), cfg.rpc_url.clone(), exit.clone());
 
     let meter: Arc<Mutex<coverage::CoverageMeter>> =
         Arc::new(Mutex::new(coverage::CoverageMeter::new()));
@@ -1078,11 +923,10 @@ fn main() -> Result<()> {
             sink.sv_no_leader.load(Ordering::Relaxed),
         );
         eprintln!("  uptime:         {}s", start.elapsed().as_secs());
-        if let Ok(sampler_guard) = oracle_sampler.lock() {
-            if let Some(sampler) = sampler_guard.as_ref() {
+        if let Ok(sampler_guard) = oracle_sampler.lock()
+            && let Some(sampler) = sampler_guard.as_ref() {
                 eprintln!("  {}", sampler.report_line());
             }
-        }
         eprintln!("═════════════════════════════════════════════════════════════════");
         eprintln!();
     }
@@ -1092,4 +936,33 @@ fn main() -> Result<()> {
     net.shutdown();
     eprintln!("[colibri] shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod shred_slot_tests {
+    use super::*;
+
+    #[test]
+    fn parses_slot_of_merkle_data_shred() {
+        let mut buf = [0u8; 88];
+        buf[64] = 0x80; // ShredVariant::MerkleData
+        buf[65..73].copy_from_slice(&123u64.to_le_bytes());
+        assert_eq!(shred_slot(&buf), Some(123));
+    }
+
+    #[test]
+    fn parses_slot_of_merkle_coding_shred() {
+        let mut buf = [0u8; 89];
+        buf[64] = 0x66; // chained Merkle code, proof_size 6
+        buf[65..73].copy_from_slice(&456u64.to_le_bytes());
+        assert_eq!(shred_slot(&buf), Some(456));
+    }
+
+    #[test]
+    fn rejects_non_shred_and_short_packets() {
+        let mut buf = [0u8; 88];
+        buf[64] = 0x00; // not a shred variant
+        assert_eq!(shred_slot(&buf), None);
+        assert_eq!(shred_slot(&[0u8; 40]), None);
+    }
 }

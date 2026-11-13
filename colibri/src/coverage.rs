@@ -55,11 +55,10 @@ impl CoverageMeter {
     /// Idempotent: if the slot was already completed, the first completion time
     /// is kept and subsequent calls are ignored.
     pub fn mark_complete(&mut self, slot: u64, at: Instant) {
-        if let Some(rec) = self.slots.get_mut(&slot) {
-            if rec.completed_at.is_none() {
+        if let Some(rec) = self.slots.get_mut(&slot)
+            && rec.completed_at.is_none() {
                 rec.completed_at = Some(at);
             }
-        }
     }
 
     /// Produce a [`CoverageReport`] over all recorded slots.
