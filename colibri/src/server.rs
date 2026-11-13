@@ -1,10 +1,12 @@
-//! The gRPC service: three streams of what the assembler emits.
+//! The gRPC service: three streams of what the assembler emits, and one of
+//! what gossip says each node runs.
 
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -17,9 +19,42 @@ pub mod shredstream {
 
 use shredstream::{
     shredstream_proxy_server::{ShredstreamProxy, ShredstreamProxyServer},
-    SubscribeEntriesRequest, SubscribeFootersRequest, SubscribeTransactionsRequest,
+    SubscribeEntriesRequest, SubscribeFootersRequest, SubscribeNodesRequest, SubscribeTransactionsRequest,
 };
-pub use shredstream::{Entry as ProtoEntry, Footer as ProtoFooter, Transaction as ProtoTransaction};
+pub use shredstream::{Entry as ProtoEntry, Footer as ProtoFooter, Node as ProtoNode, Nodes as ProtoNodes, Transaction as ProtoTransaction};
+
+/// What gossip says each node runs, and the subscribers told of every change.
+pub struct NodeBook {
+    /// The lock also orders a subscription against an update: a subscriber
+    /// takes its snapshot and its place in `changes` under it, so no change
+    /// falls between the two.
+    known:   Mutex<HashMap<Vec<u8>, ProtoNode>>,
+    changes: Sender<ProtoNodes>,
+}
+
+impl NodeBook {
+    pub fn new() -> Self {
+        // A change is a handful of nodes every few seconds: 256 is minutes of them.
+        Self { known: Mutex::new(HashMap::new()), changes: broadcast::channel(256).0 }
+    }
+
+    /// Take what gossip holds now; the nodes that are new or run something
+    /// else than before are sent to the subscribers. Returns how many.
+    pub fn update(&self, nodes: impl IntoIterator<Item = ProtoNode>) -> usize {
+        let mut known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+        let changed: Vec<ProtoNode> = nodes.into_iter()
+            .filter(|n| known.get(&n.identity) != Some(n))
+            .collect();
+        for n in &changed { known.insert(n.identity.clone(), n.clone()); }
+        if !changed.is_empty() { let _ = self.changes.send(ProtoNodes { nodes: changed.clone() }); }
+        changed.len()
+    }
+
+    fn subscribe(&self) -> (ProtoNodes, broadcast::Receiver<ProtoNodes>) {
+        let known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+        (ProtoNodes { nodes: known.values().cloned().collect() }, self.changes.subscribe())
+    }
+}
 
 /// Everything the service serves. One struct because they are always created
 /// and passed together.
@@ -27,6 +62,7 @@ pub struct Streams {
     pub entries: Arc<Sender<ProtoEntry>>,
     pub txs:     Arc<Sender<ProtoTransaction>>,
     pub footers: Arc<Sender<ProtoFooter>>,
+    pub nodes:   Arc<NodeBook>,
 }
 
 struct ColibriGrpcService {
@@ -82,6 +118,7 @@ impl ShredstreamProxy for ColibriGrpcService {
     type SubscribeEntriesStream = Stream<ProtoEntry>;
     type SubscribeTransactionsStream = Stream<ProtoTransaction>;
     type SubscribeFootersStream = Stream<ProtoFooter>;
+    type SubscribeNodesStream = Stream<ProtoNodes>;
 
     async fn subscribe_entries(&self, request: Request<SubscribeEntriesRequest>) -> Result<Response<Self::SubscribeEntriesStream>, Status> {
         check_auth(&self.auth_token, &request)?;
@@ -101,6 +138,12 @@ impl ShredstreamProxy for ColibriGrpcService {
     async fn subscribe_footers(&self, request: Request<SubscribeFootersRequest>) -> Result<Response<Self::SubscribeFootersStream>, Status> {
         check_auth(&self.auth_token, &request)?;
         Ok(forward(None, self.streams.footers.subscribe(), 256, "footers"))
+    }
+
+    async fn subscribe_nodes(&self, request: Request<SubscribeNodesRequest>) -> Result<Response<Self::SubscribeNodesStream>, Status> {
+        check_auth(&self.auth_token, &request)?;
+        let (known, changes) = self.streams.nodes.subscribe();
+        Ok(forward(Some(known), changes, 256, "node changes"))
     }
 }
 
@@ -131,4 +174,29 @@ pub fn start_grpc_server(
             eprintln!("[grpc] server error: {e}");
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(id: u8, client: &str) -> ProtoNode {
+        ProtoNode { identity: vec![id; 32], client: client.into(), version: "4.3.0".into() }
+    }
+
+    #[test]
+    fn a_subscriber_gets_all_that_is_known_and_then_only_what_changes() {
+        let book = NodeBook::new();
+        assert_eq!(book.update([node(1, "Agave"), node(2, "JitoLabs")]), 2);
+        let (known, mut changes) = book.subscribe();
+        assert_eq!(known.nodes.len(), 2);
+        // The same again is no change; a node that runs something else is, and so is a new one.
+        assert_eq!(book.update([node(1, "Agave"), node(2, "JitoLabs")]), 0);
+        assert!(changes.try_recv().is_err());
+        assert_eq!(book.update([node(1, "Agave"), node(2, "AgaveBam"), node(3, "Firedancer")]), 2);
+        let mut got: Vec<_> = changes.try_recv().unwrap().nodes.into_iter().map(|n| (n.identity[0], n.client)).collect();
+        got.sort();
+        assert_eq!(got, [(2, "AgaveBam".to_string()), (3, "Firedancer".to_string())]);
+        assert_eq!(book.subscribe().0.nodes.len(), 3);
+    }
 }

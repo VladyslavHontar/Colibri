@@ -1,4 +1,5 @@
-//! Subscribe to a Colibri gRPC transaction stream.
+//! Subscribe to a Colibri gRPC transaction stream, or with `--nodes` to what
+//! gossip says each node runs.
 //!
 //! Usage:
 //!   cargo run --example subscribe -- [OPTIONS]
@@ -6,6 +7,7 @@
 //! Options:
 //!   --url <URL>        Colibri gRPC endpoint (default: http://127.0.0.1:8888)
 //!   --token <TOKEN>    Bearer auth token (optional)
+//!   --nodes            Print the nodes by client, then every change
 
 use {
     std::{env, time::Instant},
@@ -16,19 +18,21 @@ mod shredstream {
     tonic::include_proto!("shredstream");
 }
 
-use shredstream::{shredstream_proxy_client::ShredstreamProxyClient, SubscribeTransactionsRequest};
+use shredstream::{shredstream_proxy_client::ShredstreamProxyClient, SubscribeNodesRequest, SubscribeTransactionsRequest};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let mut url = "http://127.0.0.1:8888".to_string();
     let mut token: Option<String> = None;
+    let mut nodes = false;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--url" => { i += 1; url = args[i].clone(); }
             "--token" => { i += 1; token = Some(args[i].clone()); }
+            "--nodes" => nodes = true,
             _ => {}
         }
         i += 1;
@@ -38,6 +42,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let channel = Channel::from_shared(url)?.connect().await?;
     let mut client = ShredstreamProxyClient::new(channel);
+
+    if nodes {
+        let mut request = Request::new(SubscribeNodesRequest {});
+        if let Some(tok) = &token {
+            request.metadata_mut().insert("authorization", format!("Bearer {tok}").parse::<MetadataValue<_>>()?);
+        }
+        let mut stream = client.subscribe_nodes(request).await?.into_inner();
+        let mut first = true;
+        while let Some(batch) = stream.message().await? {
+            let mut by_client = std::collections::BTreeMap::<String, usize>::new();
+            for n in &batch.nodes { *by_client.entry(n.client.clone()).or_default() += 1; }
+            println!("{} {} nodes: {by_client:?}", if first { "known:" } else { "changed:" }, batch.nodes.len());
+            first = false;
+        }
+        return Ok(());
+    }
 
     let mut request = Request::new(SubscribeTransactionsRequest {});
     if let Some(tok) = &token {

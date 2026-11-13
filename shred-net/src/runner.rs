@@ -259,6 +259,7 @@ pub struct ShredNet {
     observed_tip: Arc<AtomicU64>,
     diag:         Arc<Diag>,
     handles:      Vec<JoinHandle<()>>,
+    cluster_info: Arc<solana_gossip::cluster_info::ClusterInfo>,
     // Kept alive so gossip threads keep running; never read directly.
     _gossip:      solana_gossip::gossip_service::GossipService,
 }
@@ -377,8 +378,14 @@ impl ShredNet {
             observed_tip,
             diag,
             handles,
+            cluster_info: node.cluster_info,
             _gossip: node.gossip_service,
         })
+    }
+
+    /// Every node gossip knows now, with the client each says it runs.
+    pub fn nodes(&self) -> Vec<gossip::Node> {
+        gossip::nodes(&self.cluster_info)
     }
 
     /// Enqueue slots to repair-until-complete. Idempotent; duplicates coalesce.

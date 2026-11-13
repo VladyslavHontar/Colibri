@@ -66,6 +66,8 @@ const VERIFIED_ROOTS: usize = 16_384;
 /// Slots ahead of the tip whose leaders repair leaves alone: the leader now
 /// and the next, a leader window being 4 slots.
 const LEADERS_AHEAD: u64 = 8;
+/// How often gossip is read for what each node runs.
+const NODES_REFRESH: Duration = Duration::from_secs(5);
 
 fn print_usage() {
     eprintln!("Usage: colibri [OPTIONS]");
@@ -715,6 +717,7 @@ fn main() -> Result<()> {
 
     // Lowest slot a consumer asked to repair from (via `from-slot` metadata).
     let requested_from = Arc::new(AtomicU64::new(0));
+    let nodes = Arc::new(server::NodeBook::new());
 
     let grpc_addr: SocketAddr = format!("0.0.0.0:{}", cfg.grpc_port).parse()?;
     let grpc_handle = {
@@ -725,6 +728,7 @@ fn main() -> Result<()> {
                 entries: entry_tx.clone(),
                 txs:     tx_tx.clone(),
                 footers: footer_tx.clone(),
+                nodes:   nodes.clone(),
             },
             cfg.auth_token.clone(),
             cfg.tls_cert.clone().zip(cfg.tls_key.clone()),
@@ -832,6 +836,7 @@ fn main() -> Result<()> {
     let start = Instant::now();
     let mut served_floor: Option<u64> = None;
     let mut last_req: u64 = 0;
+    let mut nodes_read = Instant::now() - NODES_REFRESH;
     eprintln!("[colibri] serving + gap-filling (floor follows the consumer's from-slot)");
 
     let target = |a: u64, b: u64| {
@@ -853,6 +858,13 @@ fn main() -> Result<()> {
         }
         while let Ok(map) = stake_rx.try_recv() {
             net.set_stakes(map);
+        }
+        // What gossip says each node runs. A node changes it when it restarts,
+        // so every few seconds is far more often than it moves.
+        if nodes_read.elapsed() >= NODES_REFRESH {
+            nodes_read = Instant::now();
+            let changed = nodes.update(net.nodes().into_iter().map(|n| server::ProtoNode { identity: n.identity.to_vec(), client: n.client, version: n.version }));
+            if changed > 0 { eprintln!("[nodes] {changed} appeared or changed what they run"); }
         }
         // A node that hears nothing has lost the network (the host slept, the
         // NAT forgot its mapping, the link went), and on 2026-10-25 one sat so

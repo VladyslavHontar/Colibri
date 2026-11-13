@@ -33,12 +33,29 @@ message Footer {
     uint64 producer_time_nanos = 3; // leader wall clock, ns since the Unix epoch
 }
 
+// A node as gossip describes it. What a node runs decides how it orders the
+// transactions of the blocks it leads; the leader of a slot is looked up here
+// by its identity. It is what the node says of itself, not something checked.
+message Node {
+    bytes  identity = 1; // 32 bytes
+    string client   = 2; // Agave, JitoLabs, AgaveBam, HarmonicAgave, Firedancer, ...
+    string version  = 3; // major.minor.patch
+}
+
+// The first message of a subscription holds every node known; each later one
+// holds the nodes that appeared or changed since. Nodes are never removed.
+message Nodes {
+    repeated Node nodes = 1;
+}
+
 message SubscribeEntriesRequest {}
 message SubscribeTransactionsRequest {}
 message SubscribeFootersRequest {}
+message SubscribeNodesRequest {}
 
 service ShredstreamProxy {
     rpc SubscribeEntries(SubscribeEntriesRequest) returns (stream Entry);
     rpc SubscribeTransactions(SubscribeTransactionsRequest) returns (stream Transaction);
     rpc SubscribeFooters(SubscribeFootersRequest) returns (stream Footer);
+    rpc SubscribeNodes(SubscribeNodesRequest) returns (stream Nodes);
 }
