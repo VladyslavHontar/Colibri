@@ -863,8 +863,8 @@ fn main() -> Result<()> {
         // so every few seconds is far more often than it moves.
         if nodes_read.elapsed() >= NODES_REFRESH {
             nodes_read = Instant::now();
-            let changed = nodes.update(net.nodes().into_iter().map(|n| server::ProtoNode { identity: n.identity.to_vec(), client: n.client, version: n.version }));
-            if changed > 0 { eprintln!("[nodes] {changed} appeared or changed what they run"); }
+            let (changed, gone) = nodes.update(net.nodes().into_iter().map(|n| server::ProtoNode { identity: n.identity.to_vec(), client: n.client, version: n.version }));
+            if (changed, gone) != (0, 0) { eprintln!("[nodes] {changed} appeared or changed what they run, {gone} left gossip"); }
         }
         // A node that hears nothing has lost the network (the host slept, the
         // NAT forgot its mapping, the link went), and on 2026-10-25 one sat so

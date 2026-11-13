@@ -38,21 +38,25 @@ impl NodeBook {
         Self { known: Mutex::new(HashMap::new()), changes: broadcast::channel(256).0 }
     }
 
-    /// Take what gossip holds now; the nodes that are new or run something
-    /// else than before are sent to the subscribers. Returns how many.
-    pub fn update(&self, nodes: impl IntoIterator<Item = ProtoNode>) -> usize {
+    /// Take all that gossip holds now. The nodes that are new or run something
+    /// else than before, and those gossip no longer holds, are sent to the
+    /// subscribers; returns how many of each. The book is what gossip holds
+    /// and no more: identities cost nothing to make, and one that kept every
+    /// node it ever saw could be grown without end.
+    pub fn update(&self, nodes: impl IntoIterator<Item = ProtoNode>) -> (usize, usize) {
+        let now: HashMap<Vec<u8>, ProtoNode> = nodes.into_iter().map(|n| (n.identity.clone(), n)).collect();
         let mut known = self.known.lock().unwrap_or_else(|e| e.into_inner());
-        let changed: Vec<ProtoNode> = nodes.into_iter()
-            .filter(|n| known.get(&n.identity) != Some(n))
-            .collect();
-        for n in &changed { known.insert(n.identity.clone(), n.clone()); }
-        if !changed.is_empty() { let _ = self.changes.send(ProtoNodes { nodes: changed.clone() }); }
-        changed.len()
+        let changed: Vec<ProtoNode> = now.values().filter(|n| known.get(&n.identity) != Some(n)).cloned().collect();
+        let gone: Vec<Vec<u8>> = known.keys().filter(|identity| !now.contains_key(*identity)).cloned().collect();
+        *known = now;
+        let counts = (changed.len(), gone.len());
+        if counts != (0, 0) { let _ = self.changes.send(ProtoNodes { nodes: changed, gone }); }
+        counts
     }
 
     fn subscribe(&self) -> (ProtoNodes, broadcast::Receiver<ProtoNodes>) {
         let known = self.known.lock().unwrap_or_else(|e| e.into_inner());
-        (ProtoNodes { nodes: known.values().cloned().collect() }, self.changes.subscribe())
+        (ProtoNodes { nodes: known.values().cloned().collect(), gone: Vec::new() }, self.changes.subscribe())
     }
 }
 
@@ -187,16 +191,19 @@ mod tests {
     #[test]
     fn a_subscriber_gets_all_that_is_known_and_then_only_what_changes() {
         let book = NodeBook::new();
-        assert_eq!(book.update([node(1, "Agave"), node(2, "JitoLabs")]), 2);
+        assert_eq!(book.update([node(1, "Agave"), node(2, "JitoLabs")]), (2, 0));
         let (known, mut changes) = book.subscribe();
         assert_eq!(known.nodes.len(), 2);
         // The same again is no change; a node that runs something else is, and so is a new one.
-        assert_eq!(book.update([node(1, "Agave"), node(2, "JitoLabs")]), 0);
+        assert_eq!(book.update([node(1, "Agave"), node(2, "JitoLabs")]), (0, 0));
         assert!(changes.try_recv().is_err());
-        assert_eq!(book.update([node(1, "Agave"), node(2, "AgaveBam"), node(3, "Firedancer")]), 2);
+        assert_eq!(book.update([node(1, "Agave"), node(2, "AgaveBam"), node(3, "Firedancer")]), (2, 0));
         let mut got: Vec<_> = changes.try_recv().unwrap().nodes.into_iter().map(|n| (n.identity[0], n.client)).collect();
         got.sort();
         assert_eq!(got, [(2, "AgaveBam".to_string()), (3, "Firedancer".to_string())]);
-        assert_eq!(book.subscribe().0.nodes.len(), 3);
+        // A node gossip dropped is told as gone and is no longer held.
+        assert_eq!(book.update([node(2, "AgaveBam"), node(3, "Firedancer")]), (0, 1));
+        assert_eq!(changes.try_recv().unwrap().gone, [vec![1u8; 32]]);
+        assert_eq!(book.subscribe().0.nodes.len(), 2);
     }
 }

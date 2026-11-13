@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(batch) = stream.message().await? {
             let mut by_client = std::collections::BTreeMap::<String, usize>::new();
             for n in &batch.nodes { *by_client.entry(n.client.clone()).or_default() += 1; }
-            println!("{} {} nodes: {by_client:?}", if first { "known:" } else { "changed:" }, batch.nodes.len());
+            println!("{} {} nodes, {} gone: {by_client:?}", if first { "known:" } else { "changed:" }, batch.nodes.len(), batch.gone.len());
             first = false;
         }
         return Ok(());

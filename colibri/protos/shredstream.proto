@@ -42,10 +42,13 @@ message Node {
     string version  = 3; // major.minor.patch
 }
 
-// The first message of a subscription holds every node known; each later one
-// holds the nodes that appeared or changed since. Nodes are never removed.
+// The first message of a subscription holds every node gossip holds; each
+// later one holds the nodes that appeared or changed since, and the identities
+// of those gossip has dropped. A subscriber that forgets the dropped ones
+// holds no more than gossip does, whoever fills gossip with identities.
 message Nodes {
-    repeated Node nodes = 1;
+    repeated Node  nodes = 1;
+    repeated bytes gone  = 2; // 32 bytes each
 }
 
 message SubscribeEntriesRequest {}
