@@ -151,6 +151,26 @@ pub fn join(
     Ok(GossipNode { cluster_info, gossip_service, shred_version })
 }
 
+/// A node as gossip describes it: who it is and what it says it runs.
+pub struct Node {
+    pub identity: [u8; 32],
+    /// `solana_version::ClientId` by name: `Agave`, `JitoLabs`, `AgaveBam`,
+    /// `HarmonicAgave`, `Firedancer`, ... What a node runs decides how it
+    /// orders the transactions of the blocks it leads.
+    pub client:   String,
+    /// `major.minor.patch`.
+    pub version:  String,
+}
+
+/// Every node gossip holds a contact of. A node is free to say anything of
+/// itself: this is what it claims, not what was checked.
+pub fn nodes(cluster_info: &ClusterInfo) -> Vec<Node> {
+    cluster_info.all_peers().iter().map(|(info, _)| {
+        let v = info.version();
+        Node { identity: info.pubkey().to_bytes(), client: v.client().to_string(), version: format!("{}.{}.{}", v.major(), v.minor(), v.patch()) }
+    }).collect()
+}
+
 /// Score a peer by recency × log(stake). Newer contact + more stake ⇒ better.
 /// With `stake = 0` (unknown), scoring degrades to pure recency, which still
 /// produced the Phase-0 firehose.

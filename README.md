@@ -86,11 +86,12 @@ Limits: STUN only helps behind a full-cone NAT (endpoint-independent mapping and
 
 ## gRPC API
 
-Proto: [`colibri/protos/shredstream.proto`](colibri/protos/shredstream.proto). Three server streams:
+Proto: [`colibri/protos/shredstream.proto`](colibri/protos/shredstream.proto). Four server streams:
 
 - `SubscribeTransactions` — one `Transaction {slot, signature, raw_tx, complete}` per transaction; `raw_tx` is a bincode `VersionedTransaction`.
 - `SubscribeEntries` — one `Entry {slot, entries, complete}` per contiguous batch; `entries` is a bincode `Vec<solana_entry::Entry>`. A slot the leader never produced arrives as an empty blob with `complete = true`, so in-order consumers can advance past it.
 - `SubscribeFooters` — Alpenglow block footers `{slot, bank_hash, producer_time_nanos}`: the leader's own bank hash and wall clock, straight from the block. Under Alpenglow this is the only in-band source of both.
+- `SubscribeNodes` — what gossip says each node runs: `Node {identity, client, version}`, `client` being `Agave`, `JitoLabs`, `AgaveBam`, `HarmonicAgave`, `Firedancer` and so on. The first message holds every node gossip holds, each later one the nodes that appeared or changed and the identities of those gossip dropped (`gone`). What a leader runs decides how it orders a block's transactions; look the slot's leader up here by identity. It is what a node claims, not something checked. `cargo run -p colibri --example subscribe -- --nodes` prints it.
 
 `complete = true` marks the emission that finished a slot. Metadata headers: `authorization: Bearer <token>` when `auth_token` is set, and an optional `from-slot` with the subscriber's replay frontier; Colibri then backfills complete blocks from that slot to the tip instead of `tip - depth`.
 

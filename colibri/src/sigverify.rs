@@ -54,6 +54,9 @@ use {
     std::{
         collections::{HashMap, HashSet},
         str::FromStr,
+        sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
+        thread::sleep,
+        time::{Duration, Instant},
     },
 };
 
@@ -273,12 +276,11 @@ pub fn fetch_epoch_leaders(rpc_url: &str, epoch: u64, math: &EpochMath) -> Optio
         let Ok(pk) = Pubkey::from_str(pubkey_str) else { continue };
         if let Some(arr) = indices.as_array() {
             for idx_v in arr {
-                if let Some(idx) = idx_v.as_u64() {
-                    if (idx as usize) < leaders.len() {
+                if let Some(idx) = idx_v.as_u64()
+                    && (idx as usize) < leaders.len() {
                         leaders[idx as usize] = pk;
                         filled += 1;
                     }
-                }
             }
         }
     }
@@ -286,6 +288,100 @@ pub fn fetch_epoch_leaders(rpc_url: &str, epoch: u64, math: &EpochMath) -> Optio
         return None; // empty/unexpected → treat as unavailable, stay fail-closed
     }
     Some((first_slot, end_slot, leaders))
+}
+
+/// Keeps `sched` loaded, on its own thread: the epoch arithmetic once, the
+/// current epoch at the start and after every rollover, and any epoch a shred
+/// asked for and found missing. Every blocking RPC happens outside the
+/// cache's lock, so the per-shred lookup never waits on the network.
+///
+/// Fail-closed: until the arithmetic and the current epoch are loaded,
+/// `leader_for_slot` is `None` and every shred is dropped. At a rollover a
+/// tip shred of the new epoch is dropped and its epoch queued; the queue is
+/// drained every ~500 ms, so the blind window is under a second.
+pub fn spawn_schedule_fetcher(sched: Arc<Mutex<LeaderScheduleCache>>, rpc_url: String, exit: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        // Force the current-epoch preload on the first iteration.
+        let mut last_current_check = Instant::now() - Duration::from_secs(3600);
+        loop {
+            if exit.load(Ordering::Relaxed) { return; }
+
+            // ── (1) bootstrap epoch math (getEpochSchedule), once ────────
+            let math = sched.lock().unwrap_or_else(|e| e.into_inner()).math();
+            let math = match math {
+                Some(m) => m,
+                None => match fetch_epoch_math(&rpc_url) {
+                    Some(m) => {
+                        sched.lock().unwrap_or_else(|e| e.into_inner()).install_math(m);
+                        eprintln!("[sigverify] epoch math loaded: {m:?}");
+                        m
+                    }
+                    None => {
+                        eprintln!("[sigverify] getEpochSchedule failed; retrying in 1s");
+                        for _ in 0..5 {
+                            if exit.load(Ordering::Relaxed) { return; }
+                            sleep(Duration::from_millis(200));
+                        }
+                        continue;
+                    }
+                },
+            };
+
+            // ── (2) ensure current epoch loaded (startup + rollover heal) ─
+            if last_current_check.elapsed() >= Duration::from_secs(10) {
+                last_current_check = Instant::now();
+                if let Some(abs) = fetch_absolute_slot(&rpc_url)
+                    && let Some(cur_epoch) = math.epoch_of(abs) {
+                        let need = !sched.lock().unwrap_or_else(|e| e.into_inner())
+                            .has_epoch(cur_epoch);
+                        if need
+                            && let Some((fs, es, leaders)) =
+                                fetch_epoch_leaders(&rpc_url, cur_epoch, &math)
+                            {
+                                let mut g = sched.lock().unwrap_or_else(|e| e.into_inner());
+                                g.install_epoch(cur_epoch, fs, es, leaders);
+                                let (a, b) = g.loaded_range();
+                                drop(g);
+                                eprintln!(
+                                    "[sigverify] current epoch {cur_epoch} loaded; \
+                                     active schedule covers slots [{a}, {b})"
+                                );
+                            }
+                    }
+            }
+
+            // ── (3) service on-demand pending epochs (fetch OUTSIDE lock) ─
+            let pending = sched.lock().unwrap_or_else(|e| e.into_inner()).take_pending();
+            for epoch in pending {
+                if exit.load(Ordering::Relaxed) { return; }
+                if sched.lock().unwrap_or_else(|e| e.into_inner()).has_epoch(epoch) {
+                    continue; // already loaded via another path
+                }
+                match fetch_epoch_leaders(&rpc_url, epoch, &math) {
+                    Some((fs, es, leaders)) => {
+                        let mut g = sched.lock().unwrap_or_else(|e| e.into_inner());
+                        g.install_epoch(epoch, fs, es, leaders);
+                        drop(g);
+                        eprintln!("[sigverify] on-demand epoch {epoch} loaded [{fs}, {es})");
+                    }
+                    None => {
+                        // RPC has no schedule for this epoch (deep historical):
+                        // stay fail-closed — its shreds keep being dropped. A
+                        // fresh ingest miss re-queues it if it becomes relevant.
+                        eprintln!(
+                            "[sigverify] on-demand epoch {epoch} unavailable — \
+                             shreds for it stay DROPPED (fail-closed)"
+                        );
+                    }
+                }
+            }
+
+            for _ in 0..5 {
+                if exit.load(Ordering::Relaxed) { return; }
+                sleep(Duration::from_millis(100));
+            }
+        }
+    });
 }
 
 #[cfg(test)]
