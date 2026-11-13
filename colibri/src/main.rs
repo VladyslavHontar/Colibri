@@ -15,27 +15,27 @@
 //! is not emitted, never reaches the assembler, and does not advance the
 //! observed tip.
 
-#![allow(deprecated)]
 
+mod config;
 mod coverage;
 mod leader_schedule;
 mod oracle;
 mod server;
 mod sigverify;
+mod sink;
 
 use {
     anyhow::Result,
-    deshredder::{Entry, Event, VersionedTransaction},
     serde_json::Value,
     server::{ProtoEntry, ProtoFooter, ProtoTransaction},
-    shred_net::{BlockSink, ShredNet, ShredNetConfig},
+    shred_net::{ShredNet, ShredNetConfig, DISPATCH_PASS},
     solana_keypair::{read_keypair_file, write_keypair_file, Keypair},
     solana_pubkey::Pubkey,
     solana_signer::Signer,
     std::{
-        collections::{HashMap, HashSet},
+        collections::HashMap,
         env,
-        net::{IpAddr, SocketAddr},
+        net::SocketAddr,
         str::FromStr,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
@@ -47,215 +47,9 @@ use {
     tokio::sync::broadcast,
 };
 
-const TURBINE_FANOUT: usize = 200;
-
-/// Used when neither the config file nor the command line names any. One
-/// dead entrypoint stalls gossip, so the default is all five, not one.
-const MAINNET_ENTRYPOINTS: [&str; 5] = [
-    "entrypoint.mainnet-beta.solana.com:8001",
-    "entrypoint2.mainnet-beta.solana.com:8001",
-    "entrypoint3.mainnet-beta.solana.com:8001",
-    "entrypoint4.mainnet-beta.solana.com:8001",
-    "entrypoint5.mainnet-beta.solana.com:8001",
-];
-const DEFAULT_CONFIG_PATH: &str = "colibri.json";
 const TIER1_REFRESH_SECS: u64 = 600;
-/// Verified `(root, signature)` pairs kept: a slot holds a few dozen FEC sets,
-/// so this is the sets of several hundred slots, far more than are in flight.
-const VERIFIED_ROOTS: usize = 16_384;
-/// Slots ahead of the tip whose leaders repair leaves alone: the leader now
-/// and the next, a leader window being 4 slots.
-const LEADERS_AHEAD: u64 = 8;
 /// How often gossip is read for what each node runs.
 const NODES_REFRESH: Duration = Duration::from_secs(5);
-
-fn print_usage() {
-    eprintln!("Usage: colibri [OPTIONS]");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  --config <PATH>         JSON config; keys are the flags below without dashes,");
-    eprintln!("                          underscores for hyphens, `entrypoints` as an array.");
-    eprintln!("                          ./colibri.json is loaded automatically if present.");
-    eprintln!("                          Command-line flags override the file.");
-    eprintln!("  --ip <IP>               Public IP to advertise in gossip");
-    eprintln!("                          (required unless --stun is given)");
-    eprintln!("  --port <PORT>           Gossip UDP port (default: 8000)");
-    eprintln!("  --tvu-port <PORT>       TVU port where shreds arrive (default: 8200)");
-    eprintln!("  --repair-port <PORT>    UDP port for repair responses (default: 8210)");
-    eprintln!("  --stun <HOST:PORT>      STUN server; advertise each socket's real");
-    eprintln!("                          external NAT mapping instead of --ip:port.");
-    eprintln!("                          Needed behind a port-rewriting NAT; omit");
-    eprintln!("                          on a host with a real public IP.");
-    eprintln!("  --entrypoint <ADDR>     Solana entrypoint (repeatable). Default: the five");
-    eprintln!("                          mainnet-beta entrypoints; flags replace the file's list.");
-    eprintln!("  --shred-version <VER>   Shred version (default: fetched from entrypoint)");
-    eprintln!("  --rpc <URL>             RPC endpoint for stake + leader-schedule data");
-    eprintln!("  --tier1-fanout <N>      Stake table size for repair peer scoring (default: 200)");
-    eprintln!("  --grpc-port <PORT>      gRPC listen port (default: 8888)");
-    eprintln!("  --auth-token <TOKEN>    Bearer token required for gRPC subscribers (optional)");
-    eprintln!("  --tls-cert <PATH>       TLS certificate PEM (enables TLS when combined with --tls-key)");
-    eprintln!("  --tls-key <PATH>        TLS private key PEM");
-    eprintln!("  --keypair <PATH>        Path to keypair JSON file (load or auto-create for stable gossip identity)");
-    eprintln!("  --depth <N>             Backfill depth from tip when no consumer reports from-slot (default: 500)");
-    eprintln!("  --window <N>            Slots repaired in parallel (default: 64)");
-    eprintln!("  --top-peers <N>         Distinct peers repair requests are spread across (default: 128)");
-    eprintln!("  --repair-rate <N>       Most repair requests sent per second, 0 = no limit (default: 0)");
-    eprintln!("  --oracle-rpc <URL>      Enable RPC oracle cross-check (samples completed slots via getBlock)");
-    eprintln!("  --stall-secs <N>        Exit after N s without one shred, for the supervisor to restart it; 0 = never (default: 60)");
-    eprintln!("  --help                  Print this help");
-}
-
-struct Config {
-    ip:            IpAddr,
-    port:          u16,
-    tvu_port:      u16,
-    repair_port:   u16,
-    stun_server:   Option<String>,
-    entrypoints:   Vec<String>,
-    shred_version: Option<u16>,
-    rpc_url:       String,
-    tier1_fanout:  usize,
-    grpc_port:     u16,
-    auth_token:    Option<String>,
-    tls_cert:      Option<String>, // path to PEM certificate
-    tls_key:       Option<String>, // path to PEM private key
-    keypair_path:  Option<String>,
-    depth:         u64,
-    window:        usize,
-    top_peers:     usize,
-    repair_rate:   u64,
-    oracle_rpc:    Option<String>,
-    /// Seconds without one shred after which the node exits, for its
-    /// supervisor to start it again; 0 never.
-    stall_secs:    u64,
-}
-
-fn parse_args() -> Result<Config, Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    let mut ip: Option<IpAddr> = None;
-    let mut port: u16 = 8000;
-    let mut tvu_port: u16 = 8200;
-    let mut repair_port: u16 = 8210;
-    let mut stun_server: Option<String> = None;
-    let mut entrypoints: Vec<String> = Vec::new();
-    let mut shred_version: Option<u16> = None;
-    let mut rpc_url = "http://api.mainnet-beta.solana.com".to_string();
-    let mut tier1_fanout: usize = TURBINE_FANOUT;
-    let mut grpc_port: u16 = 8888;
-    let mut auth_token: Option<String> = None;
-    let mut tls_cert: Option<String> = None;
-    let mut tls_key: Option<String> = None;
-    let mut keypair_path: Option<String> = None;
-    let mut depth: u64 = 500;
-    let mut window: usize = 64;
-    let mut top_peers: usize = 128;
-    let mut repair_rate: u64 = 0;
-    let mut oracle_rpc: Option<String> = None;
-    let mut stall_secs: u64 = 60;
-
-    // Config file first, so every flag below simply overrides it. `--config`
-    // names it explicitly; otherwise ./colibri.json is used when it exists.
-    let config_path = args.iter().position(|a| a == "--config")
-        .map(|i| args.get(i + 1).cloned().ok_or("--config needs a path"))
-        .transpose()?
-        .or_else(|| std::path::Path::new(DEFAULT_CONFIG_PATH).exists().then(|| DEFAULT_CONFIG_PATH.to_string()));
-    let mut file_entrypoints: Vec<String> = Vec::new();
-    if let Some(path) = &config_path {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("config {path}: {e}"))?;
-        let v: Value = serde_json::from_str(&text).map_err(|e| format!("config {path}: {e}"))?;
-        let obj = v.as_object().ok_or_else(|| format!("config {path}: top level must be an object"))?;
-        let str_ = |k: &str| obj.get(k).map(|x| x.as_str().map(str::to_string).ok_or(format!("config {path}: `{k}` must be a string"))).transpose();
-        let num = |k: &str| obj.get(k).map(|x| x.as_u64().ok_or(format!("config {path}: `{k}` must be an integer"))).transpose();
-        for key in obj.keys() {
-            const KNOWN: [&str; 20] = ["ip","port","tvu_port","repair_port","stun","entrypoints","shred_version","rpc",
-                "tier1_fanout","grpc_port","auth_token","tls_cert","tls_key","keypair","depth","window","top_peers","repair_rate","oracle_rpc",
-                "stall_secs"];
-            if !KNOWN.contains(&key.as_str()) {
-                return Err(format!("config {path}: unknown key `{key}` (known: {})", KNOWN.join(", ")).into());
-            }
-        }
-        if let Some(x) = str_("ip")?            { ip = Some(x.parse()?); }
-        if let Some(x) = num("port")?           { port = x.try_into()?; }
-        if let Some(x) = num("tvu_port")?       { tvu_port = x.try_into()?; }
-        if let Some(x) = num("repair_port")?    { repair_port = x.try_into()?; }
-        if let Some(x) = str_("stun")?          { stun_server = Some(x); }
-        if let Some(x) = num("shred_version")?  { shred_version = Some(x.try_into()?); }
-        if let Some(x) = str_("rpc")?           { rpc_url = x; }
-        if let Some(x) = num("tier1_fanout")?   { tier1_fanout = x as usize; }
-        if let Some(x) = num("grpc_port")?      { grpc_port = x.try_into()?; }
-        if let Some(x) = str_("auth_token")?    { auth_token = Some(x); }
-        if let Some(x) = str_("tls_cert")?      { tls_cert = Some(x); }
-        if let Some(x) = str_("tls_key")?       { tls_key = Some(x); }
-        if let Some(x) = str_("keypair")?       { keypair_path = Some(x); }
-        if let Some(x) = num("depth")?          { depth = x; }
-        if let Some(x) = num("window")?         { window = x as usize; }
-        if let Some(x) = num("top_peers")?      { top_peers = x as usize; }
-        if let Some(x) = num("repair_rate")?    { repair_rate = x; }
-        if let Some(x) = str_("oracle_rpc")?    { oracle_rpc = Some(x); }
-        if let Some(x) = num("stall_secs")?     { stall_secs = x; }
-        if let Some(arr) = obj.get("entrypoints") {
-            let arr = arr.as_array().ok_or_else(|| format!("config {path}: `entrypoints` must be an array"))?;
-            for e in arr {
-                file_entrypoints.push(e.as_str().ok_or_else(|| format!("config {path}: entrypoints must be strings"))?.to_string());
-            }
-        }
-        eprintln!("[colibri] config:        {path}");
-    }
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config"        => { i += 1; } // consumed above
-            "--ip"            => { i += 1; ip            = Some(args[i].parse()?); }
-            "--port"          => { i += 1; port          = args[i].parse()?; }
-            "--tvu-port"      => { i += 1; tvu_port      = args[i].parse()?; }
-            "--repair-port"   => { i += 1; repair_port   = args[i].parse()?; }
-            "--stun"          => { i += 1; stun_server   = Some(args[i].clone()); }
-            "--entrypoint"    => { i += 1; entrypoints.push(args[i].clone()); }
-            "--shred-version" => { i += 1; shred_version = Some(args[i].parse()?); }
-            "--rpc"           => { i += 1; rpc_url       = args[i].clone(); }
-            "--tier1-fanout"  => { i += 1; tier1_fanout  = args[i].parse()?; }
-            "--grpc-port"     => { i += 1; grpc_port     = args[i].parse()?; }
-            "--auth-token"    => { i += 1; auth_token    = Some(args[i].clone()); }
-            "--tls-cert"      => { i += 1; tls_cert      = Some(args[i].clone()); }
-            "--tls-key"       => { i += 1; tls_key       = Some(args[i].clone()); }
-            "--keypair"       => { i += 1; keypair_path  = Some(args[i].clone()); }
-            "--depth"         => { i += 1; depth         = args[i].parse()?; }
-            "--window"        => { i += 1; window        = args[i].parse()?; }
-            "--top-peers"     => { i += 1; top_peers     = args[i].parse()?; }
-            "--repair-rate"   => { i += 1; repair_rate   = args[i].parse()?; }
-            "--oracle-rpc"    => { i += 1; oracle_rpc    = Some(args[i].clone()); }
-            "--stall-secs"    => { i += 1; stall_secs    = args[i].parse()?; }
-            "--help" | "-h"   => { print_usage(); std::process::exit(0); }
-            other => {
-                eprintln!("Unknown argument: {other}");
-                print_usage();
-                std::process::exit(1);
-            }
-        }
-        i += 1;
-    }
-
-    if entrypoints.is_empty() {
-        entrypoints = file_entrypoints;
-    }
-    if entrypoints.is_empty() {
-        entrypoints = MAINNET_ENTRYPOINTS.iter().map(|s| s.to_string()).collect();
-    }
-
-    // STUN derives the real advertised IP from the socket mapping itself, so
-    // --ip is only a required fallback when there's no STUN server to ask.
-    let ip = match ip {
-        Some(ip) => ip,
-        None if stun_server.is_some() => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-        None => return Err("--ip <PUBLIC_IP> is required (or pass --stun)".into()),
-    };
-    Ok(Config {
-        ip, port, tvu_port, repair_port, stun_server, entrypoints, shred_version,
-        rpc_url, tier1_fanout, grpc_port, auth_token, tls_cert, tls_key,
-        keypair_path, depth, window, top_peers, repair_rate, oracle_rpc, stall_secs,
-    })
-}
 
 /// One JSON-RPC POST; `None` on any transport or HTTP error. Plain and TLS
 /// URLs both work — the previous hand-rolled HTTP/1.0 over a raw TcpStream
@@ -301,339 +95,6 @@ fn fetch_tier1(rpc_url: &str, fanout: usize) -> Vec<(u64, [u8; 32])> {
     validators
 }
 
-/// Slot of a raw shred (LE u64 at offset 65), gated on the shred-variant byte
-/// at offset 64. Coding shreds (0x4_/0x6_/0x7_) must pass too: they are half
-/// of turbine and what lets the deshredder rebuild lost data shreds. Until
-/// 2026-10-19 this gate admitted data shreds only, so no FEC set was ever
-/// recovered and every shred turbine lost had to be repaired (~7% of slots
-/// completed in 170 s at repair_rate 500).
-fn shred_slot(buf: &[u8]) -> Option<u64> {
-    if buf.len() < 88 {
-        return None;
-    }
-    let variant = buf[64];
-    let is_shred =
-        matches!(variant & 0xF0, 0x40 | 0x60 | 0x70 | 0x80 | 0x90 | 0xB0) || variant == 0xA5;
-    if !is_shred {
-        return None;
-    }
-    Some(u64::from_le_bytes(buf[65..73].try_into().ok()?))
-}
-
-// ─── the sink: sigverify gate + gRPC fan-out of assembler events ─────────────
-
-/// Stream counters, locked once per assembler event batch.
-struct Stats {
-    last_log:   Instant,
-    /// Shreds admitted by sigverify (turbine + repair).
-    admitted:   u64,
-    published:  u64,
-    /// Block footers seen — tells whether Alpenglow markers are live upstream.
-    footers:    u64,
-    /// Since the last log line, how long after its leader made each block's
-    /// footer it was here, in ms: by the leader's clock against this host's.
-    behind_ms:  Vec<i64>,
-    /// Slots given up for holding two versions of their block.
-    equivocated: u64,
-    /// Since the last log line, how many ms ahead of its batch's end each
-    /// transaction went out, as (ms, transactions): 0 for one that waited.
-    ahead_ms:   Vec<(u64, u32)>,
-}
-
-/// Colibri's `BlockSink`: leader-keyed sigverify gate (fail-closed) and the
-/// gRPC fan-out of everything the assembler emits. One assembler serves both
-/// turbine and repair, so a batch streams the moment it is contiguous and the
-/// slot's last batch carries `complete = true`; skipped slots get an empty
-/// marker.
-struct ColibriSink {
-    stats:         Mutex<Stats>,
-    leader_sched:  Arc<Mutex<sigverify::LeaderScheduleCache>>,
-    sv_verified:   AtomicU64,
-    sv_rejected:   AtomicU64,
-    sv_no_leader:  AtomicU64,
-    /// Shreds admitted on a root whose signature was checked before.
-    sv_cached:     AtomicU64,
-    /// `(Merkle root, signature)` pairs whose signature by the slot's leader
-    /// checked out. Every shred of a FEC set proves its place under one root,
-    /// signed once, so one ed25519 check admits the whole set, as agave's own
-    /// cache does (`ledger/src/sigverify_shreds.rs`).
-    verified_roots: Mutex<HashSet<([u8; 32], [u8; 64])>>,
-    /// Per slot, when transactions of its open batch went out, and how many:
-    /// at the batch's end, how far ahead of it each went.
-    sent_at: Mutex<HashMap<u64, Vec<(Instant, u32)>>>,
-    /// Per slot, the entries of its open batch read so far, for the entry
-    /// stream to send whole at the batch's end.
-    open_batch: Mutex<HashMap<u64, Vec<Entry>>>,
-    entry_tx:      Arc<broadcast::Sender<ProtoEntry>>,
-    tx_tx:         Arc<broadcast::Sender<ProtoTransaction>>,
-    footer_tx:     Arc<broadcast::Sender<ProtoFooter>>,
-    meter:         Arc<Mutex<coverage::CoverageMeter>>,
-    oracle:        Arc<Mutex<Option<oracle::OracleSampler>>>,
-    /// Signatures per in-flight slot, kept only while the RPC oracle is on
-    /// (it cross-checks a completed slot's full signature set).
-    slot_sigs:     Mutex<HashMap<u64, HashSet<String>>>,
-    /// Highest verified slot seen (diagnostics).
-    tip:           AtomicU64,
-}
-
-impl ColibriSink {
-    /// Serialize one batch and fan it out to both streams. `complete` marks
-    /// the batch that finished the slot (see `Entry.complete` in the proto).
-    /// wincode is byte-compatible with bincode, so subscribers keep decoding
-    /// the payload exactly as before.
-    /// One whole batch on the entry stream: its contract is one message per
-    /// batch, so batch boundaries can be recorded off it. Transactions go out
-    /// on their own stream as they are read (`emit_txs`).
-    fn publish(&self, slot: u64, entries: Vec<Entry>, complete: bool) {
-        let bytes = match wincode::serialize(&entries) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("[fast] slot {slot}: wincode::serialize failed: {e}");
-                return;
-            }
-        };
-        let _ = self.entry_tx.send(ProtoEntry { slot, entries: bytes, complete });
-    }
-
-    fn emit_txs<'a>(&self, slot: u64, txs: impl Iterator<Item = &'a VersionedTransaction>, complete: bool) {
-        // Per-tx base58 + bincode is the most expensive work here; skip it
-        // entirely when nothing consumes it.
-        if self.tx_tx.receiver_count() == 0 {
-            return;
-        }
-        for tx in txs {
-            let sig = tx.signatures.first().map(|s| s.to_string()).unwrap_or_default();
-            if let Ok(raw) = bincode::serialize(tx) {
-                let _ = self.tx_tx.send(ProtoTransaction {
-                    slot, signature: sig, raw_tx: raw, complete,
-                });
-            }
-        }
-    }
-
-    /// `n` transactions of `slot`'s open batch were read just now.
-    fn read_txs(&self, slot: u64, n: usize) {
-        if n > 0 {
-            let mut sent = self.sent_at.lock().unwrap_or_else(|e| e.into_inner());
-            // ponytail: leak guard, as for slot_sigs — a slot given up never ends its batch.
-            if sent.len() > 4_096 { sent.clear(); }
-            sent.entry(slot).or_default().push((Instant::now(), n as u32));
-        }
-    }
-}
-
-impl BlockSink for ColibriSink {
-    fn leaders_near(&self, slot: u64) -> Vec<[u8; 32]> {
-        let mut schedule = self.leader_sched.lock().unwrap_or_else(|e| e.into_inner());
-        let mut leaders: Vec<[u8; 32]> = (slot..=slot + LEADERS_AHEAD).filter_map(|s| schedule.leader_for_slot(s)).map(|pk| pk.to_bytes()).collect();
-        leaders.dedup();
-        leaders
-    }
-
-    /// Sigverify gate, fail-closed either way, as agave's is:
-    /// - leader known: its signature over the Merkle root is verified, and a
-    ///   shred that fails is dropped;
-    /// - leader unknown: the shred is dropped, and the lookup records the
-    ///   epoch so the background thread fetches its schedule.
-    ///
-    /// Returning `false` keeps the shred out of the assembler (hence the gRPC
-    /// stream) and keeps it from advancing the observed tip.
-    fn on_raw_shred(&self, bytes: &[u8]) -> bool {
-        let Some(slot) = shred_slot(bytes) else { return false };
-        let (Some(root), Some(Ok(sig))) = (deshredder::merkle_root(bytes), bytes.get(..64).map(<[u8; 64]>::try_from)) else {
-            self.sv_rejected.fetch_add(1, Ordering::Relaxed);
-            return false;
-        };
-        // The root binds the slot and the shred's place: a known pair is the
-        // leader's set, whatever shred of it this is.
-        let known = self.verified_roots.lock().unwrap_or_else(|e| e.into_inner()).contains(&(root, sig));
-        if known {
-            self.sv_cached.fetch_add(1, Ordering::Relaxed);
-        } else {
-            let leader = self
-                .leader_sched
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .leader_for_slot(slot);
-            match leader {
-                Some(pk) => {
-                    if !sigverify::verify_root(&sig, &root, &pk) {
-                        self.sv_rejected.fetch_add(1, Ordering::Relaxed);
-                        return false;
-                    }
-                    self.sv_verified.fetch_add(1, Ordering::Relaxed);
-                    let mut roots = self.verified_roots.lock().unwrap_or_else(|e| e.into_inner());
-                    // ponytail: dropped whole when full, about the sets of the
-                    // last few hundred slots; an LRU if re-verifying them shows.
-                    if roots.len() >= VERIFIED_ROOTS {
-                        roots.clear();
-                    }
-                    roots.insert((root, sig));
-                }
-                None => {
-                    self.sv_no_leader.fetch_add(1, Ordering::Relaxed);
-                    return false;
-                }
-            }
-        }
-
-        self.tip.fetch_max(slot, Ordering::Relaxed);
-        self.stats.lock().unwrap_or_else(|e| e.into_inner()).admitted += 1;
-        true
-    }
-
-    /// Wire contract: `complete = true` rides on the batch that finished the
-    /// slot. Batches and completion are separate events, so hold each batch
-    /// until we know whether completion follows it.
-    fn on_events(&self, events: Vec<Event>) {
-        let oracle_on = self.oracle.lock().map(|g| g.is_some()).unwrap_or(false);
-        let mut pending: Option<(u64, Vec<Entry>)> = None;
-        let mut ahead_ms: Vec<(u64, u32)> = Vec::new();
-        let mut published = 0u64;
-        let mut footers = 0u64;
-        let mut behind_ms: Vec<i64> = Vec::new();
-        let mut equivocated = 0u64;
-        for ev in events {
-            match ev {
-                Event::Entries { slot, entries, announced } => {
-                    self.read_txs(slot, entries.iter().map(|e| e.transactions.len()).sum::<usize>() - announced);
-                    if oracle_on {
-                        let mut m = self.slot_sigs.lock().unwrap_or_else(|e| e.into_inner());
-                        // ponytail: leak guard — a slot that never completes stays here.
-                        if m.len() > 4_096 { m.clear(); }
-                        m.entry(slot).or_default().extend(
-                            entries.iter().flat_map(|e| &e.transactions)
-                                .filter_map(|tx| tx.signatures.first()).map(|s| s.to_string()));
-                    }
-                    // Transactions now, those announced ahead of their entry aside;
-                    // the entries with their batch.
-                    let txs = entries.iter().enumerate().flat_map(|(k, e)| e.transactions.iter().skip(if k == 0 { announced } else { 0 }));
-                    self.emit_txs(slot, txs, false);
-                    let mut open = self.open_batch.lock().unwrap_or_else(|e| e.into_inner());
-                    // ponytail: leak guard, as for slot_sigs — a slot given up never ends its batch.
-                    if open.len() > 4_096 { open.clear(); }
-                    open.entry(slot).or_default().extend(entries);
-                }
-                Event::Transactions { slot, transactions } => {
-                    self.read_txs(slot, transactions.len());
-                    self.emit_txs(slot, transactions.iter(), false);
-                }
-                Event::BatchEnd { slot } => {
-                    let batch = self.open_batch.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot).unwrap_or_default();
-                    if !batch.is_empty()
-                        && let Some((s, e)) = pending.replace((slot, batch)) {
-                            self.publish(s, e, false);
-                            published += 1;
-                        }
-                    // How far ahead of this moment each of the batch's transactions was read.
-                    let now = Instant::now();
-                    if let Some(sent) = self.sent_at.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot) {
-                        ahead_ms.extend(sent.into_iter().map(|(t, n)| (now.duration_since(t).as_millis() as u64, n)));
-                    }
-                }
-                Event::SlotComplete { slot } => {
-                    self.meter
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .mark_complete(slot, Instant::now());
-                    if oracle_on {
-                        let sigs = self.slot_sigs.lock().unwrap_or_else(|e| e.into_inner())
-                            .remove(&slot).unwrap_or_default();
-                        if let Ok(mut guard) = self.oracle.lock()
-                            && let Some(sampler) = guard.as_mut() {
-                                sampler.on_complete(slot, &sigs);
-                            }
-                    }
-                    let entries = match pending.take() {
-                        Some((s, e)) if s == slot => e,
-                        other => { if let Some((s, e)) = other { self.publish(s, e, false); published += 1; } Vec::new() }
-                    };
-                    self.publish(slot, entries, true);
-                    published += 1;
-                }
-                Event::Footer { slot, bank_hash, producer_time_nanos } => {
-                    footers += 1;
-                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
-                    behind_ms.push((now - producer_time_nanos as i64) / 1_000_000);
-                    let _ = self.footer_tx.send(ProtoFooter {
-                        slot,
-                        bank_hash: bank_hash.to_bytes().to_vec(),
-                        producer_time_nanos,
-                    });
-                }
-                Event::UndecodableBatch { slot, first_index, last_index } => {
-                    eprintln!("[stream] slot {slot}: shreds {first_index}..={last_index} did not decode as a BlockComponent");
-                }
-                Event::Equivocated { slot } => {
-                    // Which version is the block cannot be told from the shreds;
-                    // repair finds no data for it and reports it skipped.
-                    equivocated += 1;
-                    self.open_batch.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot);
-                    eprintln!("[stream] slot {slot}: its leader sent two versions of the block; neither is streamed");
-                }
-            }
-        }
-        if let Some((s, e)) = pending.take() {
-            self.publish(s, e, false);
-            published += 1;
-        }
-        let mut st = self.stats.lock().unwrap_or_else(|e| e.into_inner());
-        st.published += published;
-        st.footers += footers;
-        st.behind_ms.extend(behind_ms);
-        st.ahead_ms.extend(ahead_ms);
-        st.equivocated += equivocated;
-        if st.last_log.elapsed() >= Duration::from_secs(10) {
-            st.behind_ms.sort_unstable();
-            let at = |q: f64| st.behind_ms.get(((st.behind_ms.len().max(1) - 1) as f64 * q) as usize).copied();
-            let (p10, p50, p90) = (at(0.1), at(0.5), at(0.9));
-            // Transactions ahead of their batch's end, weighted by count.
-            st.ahead_ms.sort_unstable();
-            let total: u64 = st.ahead_ms.iter().map(|(_, n)| u64::from(*n)).sum();
-            let ahead = |q: f64| {
-                let mut left = (total as f64 * q) as u64;
-                st.ahead_ms.iter().find(|(_, n)| { let n = u64::from(*n); if left < n { true } else { left -= n; false } }).map(|(ms, _)| *ms)
-            };
-            let early_share = if total > 0 { 100.0 * st.ahead_ms.iter().filter(|(ms, _)| *ms >= 1).map(|(_, n)| f64::from(*n)).sum::<f64>() / total as f64 } else { 0.0 };
-            eprintln!(
-                "[stream] admitted={} published={} footers={} tip={} equivocated={} \
-                 behind_leader_ms[p10={p10:?} p50={p50:?} p90={p90:?}] \
-                 txs_ahead_of_batch_end[{total} txs, {early_share:.0}% >=1ms, p50={:?} p90={:?} p99={:?} max={:?} ms] \
-                 sigverify[ok={} by_known_root={} rejected={} dropped_no_leader={}]",
-                st.admitted,
-                st.published,
-                st.footers,
-                self.tip.load(Ordering::Relaxed),
-                st.equivocated,
-                ahead(0.5),
-                ahead(0.9),
-                ahead(0.99),
-                st.ahead_ms.last().map(|(ms, _)| *ms),
-                self.sv_verified.load(Ordering::Relaxed),
-                self.sv_cached.load(Ordering::Relaxed),
-                self.sv_rejected.load(Ordering::Relaxed),
-                self.sv_no_leader.load(Ordering::Relaxed),
-            );
-            st.last_log = Instant::now();
-            st.behind_ms.clear();
-            st.ahead_ms.clear();
-        }
-    }
-
-    /// The slot was never produced. Emit an EMPTY Entry message so an in-order
-    /// replay consumer advances past it instead of stalling; count it as
-    /// accounted-for in coverage.
-    fn on_slot_skipped(&self, slot: u64) {
-        self.meter
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .mark_complete(slot, Instant::now());
-        if let Ok(bytes) = wincode::serialize(&Vec::<Entry>::new()) {
-            let _ = self.entry_tx.send(ProtoEntry { slot, entries: bytes, complete: true });
-        }
-    }
-}
-
 /// Load a Solana keypair JSON file, or generate a fresh one and save it so
 /// gossip identity survives restarts. Format is the standard Solana JSON array
 /// of 64 bytes — compatible with `solana-keygen new` output.
@@ -654,18 +115,8 @@ fn load_or_create_keypair(path: &str) -> Keypair {
     }
 }
 
-fn main() -> Result<()> {
-    env_logger::init();
-    let cfg = parse_args().map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let keypair = Arc::new(match &cfg.keypair_path {
-        Some(path) => load_or_create_keypair(path),
-        None => {
-            let kp = Keypair::new();
-            eprintln!("[colibri] keypair:       ephemeral (use --keypair <path> for stable identity)  pubkey={}", kp.pubkey());
-            kp
-        }
-    });
+/// What the node was started with, on the log.
+fn announce(cfg: &config::Config, keypair: &Keypair) {
     eprintln!("[colibri] pubkey:        {}", keypair.pubkey());
     match &cfg.stun_server {
         Some(stun) => eprintln!("[colibri] advertise ip:  discovered via STUN ({stun}) per socket at bind"),
@@ -687,6 +138,73 @@ fn main() -> Result<()> {
     eprintln!("[colibri] tier1-fanout:  {}", cfg.tier1_fanout);
     eprintln!("[colibri] depth:         {}  window: {}  top-peers: {}  repair-rate: {}", cfg.depth, cfg.window, cfg.top_peers,
         if cfg.repair_rate == 0 { "no limit".to_string() } else { format!("{}/s", cfg.repair_rate) });
+}
+
+/// Repair weighs its peers by stake: the table is fetched now and again every
+/// `TIER1_REFRESH_SECS`, each new one sent to the returned channel for the
+/// main loop to hand to the network.
+fn follow_stakes(net: &ShredNet, cfg: &config::Config, exit: Arc<AtomicBool>) -> std::sync::mpsc::Receiver<HashMap<[u8; 32], u64>> {
+    let by_node = |v: Vec<(u64, [u8; 32])>| -> HashMap<[u8; 32], u64> { v.into_iter().map(|(stake, node)| (node, stake)).collect() };
+    net.set_stakes(by_node(fetch_tier1(&cfg.rpc_url, cfg.tier1_fanout)));
+    let (stake_tx, stake_rx) = std::sync::mpsc::channel();
+    let (rpc_url, fanout) = (cfg.rpc_url.clone(), cfg.tier1_fanout);
+    std::thread::spawn(move || loop {
+        sleep(Duration::from_secs(TIER1_REFRESH_SECS));
+        if exit.load(Ordering::Relaxed) { break; }
+        let updated = fetch_tier1(&rpc_url, fanout);
+        // An empty table is a node that did not answer: what is held stays.
+        if !updated.is_empty() && stake_tx.send(by_node(updated)).is_err() { break; }
+    });
+    stake_rx
+}
+
+/// What was covered and how fast, printed when the node is stopped.
+fn report(meter: &Mutex<coverage::CoverageMeter>, sink: &sink::ColibriSink, oracle_sampler: &Mutex<Option<oracle::OracleSampler>>, uptime: Duration) {
+    let rpt = meter.lock().unwrap_or_else(|e| e.into_inner()).report();
+    let completeness_label = if rpt.completeness_pct >= 99.9 {
+        "GREEN"
+    } else if rpt.completeness_pct >= 50.0 {
+        "YELLOW"
+    } else {
+        "RED"
+    };
+
+    eprintln!();
+    eprintln!("════════════════════ COLIBRI COVERAGE REPORT ════════════════════");
+    eprintln!("  status:         {completeness_label}");
+    eprintln!("  targeted:       {}", rpt.targeted);
+    eprintln!("  completed:      {}", rpt.completed);
+    eprintln!("  completeness:   {:.2}%", rpt.completeness_pct);
+    eprintln!("  latency p50:    {} ms", rpt.p50_ms);
+    eprintln!("  latency p99:    {} ms", rpt.p99_ms);
+    eprintln!("  latency max:    {} ms", rpt.max_ms);
+    eprintln!("  sigverify:      {}", sink.sigverify());
+    eprintln!("  uptime:         {}s", uptime.as_secs());
+    if let Ok(sampler_guard) = oracle_sampler.lock()
+        && let Some(sampler) = sampler_guard.as_ref() {
+            eprintln!("  {}", sampler.report_line());
+        }
+    eprintln!("═════════════════════════════════════════════════════════════════");
+    eprintln!();
+}
+
+fn main() -> Result<()> {
+    env_logger::init();
+    let cfg = match config::Config::from_args(&env::args().collect::<Vec<_>>()) {
+        Ok(Some(cfg)) => cfg,
+        Ok(None) => { eprint!("{}", config::usage()); return Ok(()); }
+        Err(e) => { eprint!("{e}\n\n{}", config::usage()); std::process::exit(1); }
+    };
+
+    let keypair = Arc::new(match &cfg.keypair_path {
+        Some(path) => load_or_create_keypair(path),
+        None => {
+            let kp = Keypair::new();
+            eprintln!("[colibri] keypair:       ephemeral (use --keypair <path> for stable identity)  pubkey={}", kp.pubkey());
+            kp
+        }
+    });
+    announce(&cfg, &keypair);
 
     if let (Some(cert_path), Some(key_path)) = (&cfg.tls_cert, &cfg.tls_key) {
         std::fs::metadata(cert_path)
@@ -758,32 +276,7 @@ fn main() -> Result<()> {
             oracle::OracleSampler::new(url.clone())
         })));
 
-    let sink = Arc::new(ColibriSink {
-        stats: Mutex::new(Stats {
-            last_log:   Instant::now(),
-            admitted:   0,
-            published:  0,
-            footers:    0,
-            behind_ms:  Vec::new(),
-            equivocated: 0,
-            ahead_ms:   Vec::new(),
-        }),
-        leader_sched:  leader_sched.clone(),
-        sv_verified:   AtomicU64::new(0),
-        sv_rejected:   AtomicU64::new(0),
-        sv_no_leader:  AtomicU64::new(0),
-        sv_cached:     AtomicU64::new(0),
-        verified_roots: Mutex::new(HashSet::new()),
-        sent_at:       Mutex::new(HashMap::new()),
-        open_batch:    Mutex::new(HashMap::new()),
-        entry_tx,
-        tx_tx,
-        footer_tx,
-        meter:         meter.clone(),
-        oracle:        oracle_sampler.clone(),
-        slot_sigs:     Mutex::new(HashMap::new()),
-        tip:           AtomicU64::new(0),
-    });
+    let sink = Arc::new(sink::ColibriSink::new(leader_sched, entry_tx, tx_tx, footer_tx, meter.clone(), oracle_sampler.clone()));
 
     // ── start the shred network (gossip + TVU + repair + reconstruction) ─────
     let net = ShredNet::start(
@@ -809,25 +302,7 @@ fn main() -> Result<()> {
     )?;
     eprintln!("[colibri] ShredNet started — waiting for first turbine shred…");
 
-    // ── tier-1 stakes: initial fetch + periodic refresh → repair peer scoring ─
-    let to_stake_map = |v: Vec<(u64, [u8; 32])>| -> HashMap<[u8; 32], u64> {
-        v.into_iter().map(|(stake, pk)| (pk, stake)).collect()
-    };
-    net.set_stakes(to_stake_map(fetch_tier1(&cfg.rpc_url, cfg.tier1_fanout)));
-    let (stake_tx, stake_rx) = std::sync::mpsc::channel::<HashMap<[u8; 32], u64>>();
-    {
-        let rpc_url_c = cfg.rpc_url.clone();
-        let fanout    = cfg.tier1_fanout;
-        let exit_t1   = exit.clone();
-        std::thread::spawn(move || loop {
-            sleep(Duration::from_secs(TIER1_REFRESH_SECS));
-            if exit_t1.load(Ordering::Relaxed) { break; }
-            let updated = fetch_tier1(&rpc_url_c, fanout);
-            if !updated.is_empty() && stake_tx.send(to_stake_map(updated)).is_err() {
-                break;
-            }
-        });
-    }
+    let stake_rx = follow_stakes(&net, &cfg, exit.clone());
 
     // ── frontier loop: repair [floor .. live tip] ────────────────────────────
     // `floor` is the lowest `from-slot` any subscriber reported, else
@@ -876,7 +351,7 @@ fn main() -> Result<()> {
         }
         let tip = net.observed_tip();
         if tip == 0 {
-            sleep(Duration::from_millis(250));
+            sleep(DISPATCH_PASS);
             continue;
         }
 
@@ -905,76 +380,17 @@ fn main() -> Result<()> {
             target(last_req + 1, tip - 1);
             last_req = tip - 1;
         }
-        sleep(Duration::from_millis(400));
+        // The tip is followed at the pace the repair driver takes slots up
+        // at: a pause written as a slot's length left a new slot unasked for
+        // about two slots once a slot was no longer 400 ms.
+        sleep(DISPATCH_PASS);
     }
 
-    // ── final report (printed on Ctrl-C) ─────────────────────────────────────
-    {
-        let rpt = meter.lock().unwrap_or_else(|e| e.into_inner()).report();
-        let completeness_label = if rpt.completeness_pct >= 99.9 {
-            "GREEN"
-        } else if rpt.completeness_pct >= 50.0 {
-            "YELLOW"
-        } else {
-            "RED"
-        };
-
-        eprintln!();
-        eprintln!("════════════════════ COLIBRI COVERAGE REPORT ════════════════════");
-        eprintln!("  status:         {completeness_label}");
-        eprintln!("  targeted:       {}", rpt.targeted);
-        eprintln!("  completed:      {}", rpt.completed);
-        eprintln!("  completeness:   {:.2}%", rpt.completeness_pct);
-        eprintln!("  latency p50:    {} ms", rpt.p50_ms);
-        eprintln!("  latency p99:    {} ms", rpt.p99_ms);
-        eprintln!("  latency max:    {} ms", rpt.max_ms);
-        eprintln!(
-            "  sigverify:      ok={} rejected={} dropped_no_leader={}",
-            sink.sv_verified.load(Ordering::Relaxed),
-            sink.sv_rejected.load(Ordering::Relaxed),
-            sink.sv_no_leader.load(Ordering::Relaxed),
-        );
-        eprintln!("  uptime:         {}s", start.elapsed().as_secs());
-        if let Ok(sampler_guard) = oracle_sampler.lock()
-            && let Some(sampler) = sampler_guard.as_ref() {
-                eprintln!("  {}", sampler.report_line());
-            }
-        eprintln!("═════════════════════════════════════════════════════════════════");
-        eprintln!();
-    }
+    report(&meter, &sink, &oracle_sampler, start.elapsed());
 
     eprintln!("[colibri] waiting for gRPC server to shut down...");
     rt.block_on(grpc_handle).ok();
     net.shutdown();
     eprintln!("[colibri] shutdown complete");
     Ok(())
-}
-
-#[cfg(test)]
-mod shred_slot_tests {
-    use super::*;
-
-    #[test]
-    fn parses_slot_of_merkle_data_shred() {
-        let mut buf = [0u8; 88];
-        buf[64] = 0x80; // ShredVariant::MerkleData
-        buf[65..73].copy_from_slice(&123u64.to_le_bytes());
-        assert_eq!(shred_slot(&buf), Some(123));
-    }
-
-    #[test]
-    fn parses_slot_of_merkle_coding_shred() {
-        let mut buf = [0u8; 89];
-        buf[64] = 0x66; // chained Merkle code, proof_size 6
-        buf[65..73].copy_from_slice(&456u64.to_le_bytes());
-        assert_eq!(shred_slot(&buf), Some(456));
-    }
-
-    #[test]
-    fn rejects_non_shred_and_short_packets() {
-        let mut buf = [0u8; 88];
-        buf[64] = 0x00; // not a shred variant
-        assert_eq!(shred_slot(&buf), None);
-        assert_eq!(shred_slot(&[0u8; 40]), None);
-    }
 }

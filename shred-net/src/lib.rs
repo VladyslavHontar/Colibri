@@ -23,4 +23,4 @@ pub mod stun;
 pub mod runner;
 pub mod wire;
 
-pub use runner::{BlockSink, ShredNet, ShredNetConfig};
+pub use runner::{BlockSink, ShredNet, ShredNetConfig, DISPATCH_PASS};

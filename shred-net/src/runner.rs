@@ -44,6 +44,11 @@ use {
     },
 };
 
+/// How often the repair driver takes up newly asked slots, picks what each
+/// slot in flight needs and sends it. Whoever asks for slots gains nothing by
+/// asking more often than this.
+pub const DISPATCH_PASS: Duration = Duration::from_millis(10);
+
 /// Max shreds coalesced into a single `insert_batch` (one assembler lock) call.
 const MAX_BATCH: usize = 1024;
 /// Bounded insert-channel capacity. Full ⇒ insert worker is the bottleneck.
@@ -251,13 +256,44 @@ impl DriverState {
     }
 }
 
+/// What the threads share.
+struct Shared {
+    exit:         Arc<AtomicBool>,
+    /// Slots asked for and not yet taken up by the repair driver.
+    targets:      Mutex<VecDeque<u64>>,
+    /// Node identity to activated stake: what repair weighs its peers by.
+    stakes:       Mutex<HashMap<[u8; 32], u64>>,
+    /// Highest slot a turbine data shred was admitted for.
+    observed_tip: AtomicU64,
+    diag:         Diag,
+    sink:         Arc<dyn BlockSink>,
+}
+
+impl Shared {
+    fn exiting(&self) -> bool { self.exit.load(Ordering::Relaxed) }
+
+    /// A shred off a socket: past the sink's gate (fail-closed: one it does
+    /// not admit neither advances the tip nor reaches the assembler), then to
+    /// the insert worker. False when that worker is gone and the thread
+    /// should stop.
+    fn take(&self, bytes: &[u8], from_turbine: bool, insert_tx: &SyncSender<Vec<u8>>) -> bool {
+        if !self.sink.on_raw_shred(bytes) { return true; }
+        self.diag.admitted(bytes, from_turbine);
+        if from_turbine && let Some(slot) = slot_of(bytes) {
+            self.observed_tip.fetch_max(slot, Ordering::Relaxed);
+        }
+        match insert_tx.try_send(bytes.to_vec()) {
+            Ok(()) => true,
+            // The insert worker is the bottleneck: counted, and the shred is repaired later.
+            Err(TrySendError::Full(_)) => { self.diag.chan_drop.fetch_add(1, Ordering::Relaxed); true }
+            Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+}
+
 /// A live shred-network participant + repair-driven reconstructor.
 pub struct ShredNet {
-    exit:         Arc<AtomicBool>,
-    targets:      Arc<Mutex<VecDeque<u64>>>,
-    stakes:       Arc<Mutex<HashMap<[u8; 32], u64>>>,
-    observed_tip: Arc<AtomicU64>,
-    diag:         Arc<Diag>,
+    shared:       Arc<Shared>,
     handles:      Vec<JoinHandle<()>>,
     cluster_info: Arc<solana_gossip::cluster_info::ClusterInfo>,
     // Kept alive so gossip threads keep running; never read directly.
@@ -308,10 +344,14 @@ impl ShredNet {
         )?;
 
         let reconstructor = Arc::new(Reconstructor::new());
-        let targets: Arc<Mutex<VecDeque<u64>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let stakes: Arc<Mutex<HashMap<[u8; 32], u64>>> = Arc::new(Mutex::new(HashMap::new()));
-        let observed_tip = Arc::new(AtomicU64::new(0));
-        let diag = Arc::new(Diag::default());
+        let shared = Arc::new(Shared {
+            exit: exit.clone(),
+            targets: Mutex::default(),
+            stakes: Mutex::default(),
+            observed_tip: AtomicU64::new(0),
+            diag: Diag::default(),
+            sink,
+        });
 
         // Bounded insert channel — backpressure reveals an insert-bound state.
         let (insert_tx, insert_rx) = sync_channel::<Vec<u8>>(INSERT_CHAN_CAP);
@@ -334,49 +374,13 @@ impl ShredNet {
                 exit.clone(),
             ));
         }
-        handles.push(spawn_tvu(
-            tvu_socket,
-            exit.clone(),
-            insert_tx.clone(),
-            sink.clone(),
-            observed_tip.clone(),
-            diag.clone(),
-        ));
-        handles.push(spawn_repair_recv(
-            repair_sock.clone(),
-            exit.clone(),
-            keypair.clone(),
-            insert_tx,
-            sink.clone(),
-            diag.clone(),
-        ));
-        handles.push(spawn_insert_worker(
-            exit.clone(),
-            insert_rx,
-            reconstructor.clone(),
-            sink.clone(),
-            diag.clone(),
-        ));
-        handles.push(spawn_dispatch(
-            &cfg,
-            repair_sock,
-            keypair,
-            exit.clone(),
-            node.cluster_info.clone(),
-            reconstructor,
-            sink,
-            targets.clone(),
-            stakes.clone(),
-            observed_tip.clone(),
-            diag.clone(),
-        ));
+        handles.push(spawn_tvu(tvu_socket, shared.clone(), insert_tx.clone()));
+        handles.push(spawn_repair_recv(repair_sock.clone(), keypair.clone(), shared.clone(), insert_tx));
+        handles.push(spawn_insert_worker(insert_rx, reconstructor.clone(), shared.clone()));
+        handles.push(spawn_dispatch(&cfg, repair_sock, keypair, node.cluster_info.clone(), reconstructor, shared.clone()));
 
         Ok(Self {
-            exit,
-            targets,
-            stakes,
-            observed_tip,
-            diag,
+            shared,
             handles,
             cluster_info: node.cluster_info,
             _gossip: node.gossip_service,
@@ -390,32 +394,32 @@ impl ShredNet {
 
     /// Enqueue slots to repair-until-complete. Idempotent; duplicates coalesce.
     pub fn request_slots(&self, slots: impl IntoIterator<Item = u64>) {
-        let mut q = self.targets.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = self.shared.targets.lock().unwrap_or_else(|e| e.into_inner());
         q.extend(slots);
     }
 
     /// Update the stake table used to weight repair-peer selection (node pubkey
     /// → activated stake). Empty ⇒ recency-only peer scoring.
     pub fn set_stakes(&self, map: HashMap<[u8; 32], u64>) {
-        *self.stakes.lock().unwrap_or_else(|e| e.into_inner()) = map;
+        *self.shared.stakes.lock().unwrap_or_else(|e| e.into_inner()) = map;
     }
 
     /// Highest slot observed on the TVU socket so far (0 until the first shred).
     pub fn observed_tip(&self) -> u64 {
-        self.observed_tip.load(Ordering::Relaxed)
+        self.shared.observed_tip.load(Ordering::Relaxed)
     }
 
     /// How long since the last shred arrived, turbine or repair; `None`
     /// before the first. A node that hears nothing has lost the network,
     /// whatever its threads say.
     pub fn silent_for(&self) -> Option<Duration> {
-        let last = self.diag.last_shred_ms.load(Ordering::Relaxed);
+        let last = self.shared.diag.last_shred_ms.load(Ordering::Relaxed);
         (last > 0).then(|| Duration::from_millis(now_millis().saturating_sub(last)))
     }
 
     /// Signal shutdown and join the worker threads.
     pub fn shutdown(self) {
-        self.exit.store(true, Ordering::SeqCst);
+        self.shared.exit.store(true, Ordering::SeqCst);
         for h in self.handles {
             let _ = h.join();
         }
@@ -436,53 +440,16 @@ fn slot_of(buf: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(buf[65..73].try_into().ok()?))
 }
 
-/// Hand a shred to the insert worker; count a drop if the channel is full
-/// (insert-bound). Returns false if the channel is disconnected (shutdown).
-fn submit(tx: &SyncSender<Vec<u8>>, bytes: &[u8], diag: &Diag) -> bool {
-    match tx.try_send(bytes.to_vec()) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) => {
-            diag.chan_drop.fetch_add(1, Ordering::Relaxed);
-            true
-        }
-        Err(TrySendError::Disconnected(_)) => false,
-    }
-}
-
 /// Drain turbine. The socket is bound and configured by the caller so its NAT
 /// mapping can be discovered before gossip advertises it.
-fn spawn_tvu(
-    tvu_socket: Arc<UdpSocket>,
-    exit: Arc<AtomicBool>,
-    insert_tx: SyncSender<Vec<u8>>,
-    sink: Arc<dyn BlockSink>,
-    observed_tip: Arc<AtomicU64>,
-    diag: Arc<Diag>,
-) -> JoinHandle<()> {
+fn spawn_tvu(tvu_socket: Arc<UdpSocket>, shared: Arc<Shared>, insert_tx: SyncSender<Vec<u8>>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 1280];
-        loop {
-            if exit.load(Ordering::Relaxed) {
-                break;
-            }
+        while !shared.exiting() {
             match tvu_socket.recv_from(&mut buf) {
-                Ok((n, _)) => {
-                    let bytes = &buf[..n];
-                    // Fail-closed: an unadmitted (unverified) shred neither
-                    // advances the tip nor reaches the assembler.
-                    if sink.on_raw_shred(bytes) {
-                        diag.admitted(bytes, true);
-                        if let Some(slot) = slot_of(bytes) {
-                            observed_tip.fetch_max(slot, Ordering::Relaxed);
-                        }
-                        if !submit(&insert_tx, bytes, &diag) {
-                            break;
-                        }
-                    }
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Ok((n, _)) => if !shared.take(&buf[..n], true, &insert_tx) { break },
+                // Nothing came within the read timeout.
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
                 Err(e) => log::warn!("[shred-net][tvu] recv error: {e}"),
             }
         }
@@ -491,42 +458,25 @@ fn spawn_tvu(
 
 /// Drains the repair socket continuously — pong replies inline (cheap), shred
 /// responses handed to the insert worker, so assembly never stalls draining.
-fn spawn_repair_recv(
-    repair_sock: Arc<UdpSocket>,
-    exit: Arc<AtomicBool>,
-    keypair: Arc<Keypair>,
-    insert_tx: SyncSender<Vec<u8>>,
-    sink: Arc<dyn BlockSink>,
-    diag: Arc<Diag>,
-) -> JoinHandle<()> {
+fn spawn_repair_recv(repair_sock: Arc<UdpSocket>, keypair: Arc<Keypair>, shared: Arc<Shared>, insert_tx: SyncSender<Vec<u8>>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 1500];
-        loop {
-            if exit.load(Ordering::Relaxed) {
-                break;
-            }
+        let diag = &shared.diag;
+        while !shared.exiting() {
             // An error is WouldBlock or TimedOut on the read timeout: nothing came.
-            if let Ok((n, src)) = repair_sock.recv_from(&mut buf) {
-                match wire::parse_inbound(&buf[..n]) {
-                    wire::Inbound::Ping(token) => {
-                        diag.pings.fetch_add(1, Ordering::Relaxed);
-                        let pong = wire::build_pong(&keypair, token);
-                        if repair_sock.send_to(&pong, src).is_ok() {
-                            diag.pongs.fetch_add(1, Ordering::Relaxed);
-                        }
+            let Ok((n, src)) = repair_sock.recv_from(&mut buf) else { continue };
+            match wire::parse_inbound(&buf[..n]) {
+                wire::Inbound::Ping(token) => {
+                    diag.pings.fetch_add(1, Ordering::Relaxed);
+                    if repair_sock.send_to(&wire::build_pong(&keypair, token), src).is_ok() {
+                        diag.pongs.fetch_add(1, Ordering::Relaxed);
                     }
-                    wire::Inbound::ShredResponse => {
-                        diag.resp.fetch_add(1, Ordering::Relaxed);
-                        // Same fail-closed gate as the TVU path.
-                        if sink.on_raw_shred(&buf[..n]) {
-                            diag.admitted(&buf[..n], false);
-                            if !submit(&insert_tx, &buf[..n], &diag) {
-                                break;
-                            }
-                        }
-                    }
-                    wire::Inbound::Other => {}
                 }
+                wire::Inbound::ShredResponse => {
+                    diag.resp.fetch_add(1, Ordering::Relaxed);
+                    if !shared.take(&buf[..n], false, &insert_tx) { break; }
+                }
+                wire::Inbound::Other => {}
             }
         }
     })
@@ -534,54 +484,58 @@ fn spawn_repair_recv(
 
 /// Batches shreds off the channel into the assembler — one lock per
 /// up-to-MAX_BATCH shreds — and hands whatever came out to the sink.
-fn spawn_insert_worker(
-    exit: Arc<AtomicBool>,
-    insert_rx: Receiver<Vec<u8>>,
-    reconstructor: Arc<Reconstructor>,
-    sink: Arc<dyn BlockSink>,
-    diag: Arc<Diag>,
-) -> JoinHandle<()> {
+fn spawn_insert_worker(insert_rx: Receiver<Vec<u8>>, reconstructor: Arc<Reconstructor>, shared: Arc<Shared>) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut batch: Vec<Vec<u8>> = Vec::with_capacity(MAX_BATCH);
         let mut events: Vec<Event> = Vec::new();
-        loop {
-            if exit.load(Ordering::Relaxed) {
-                break;
-            }
+        while !shared.exiting() {
             batch.clear();
             match insert_rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(first) => batch.push(first),
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => break,
             }
-            while batch.len() < MAX_BATCH {
-                match insert_rx.try_recv() {
-                    Ok(b) => batch.push(b),
-                    Err(_) => break,
-                }
-            }
+            batch.extend(insert_rx.try_iter().take(MAX_BATCH - 1));
             let n = reconstructor.insert_batch(&batch, &mut events);
-            diag.inserted.fetch_add(n as u64, Ordering::Relaxed);
+            shared.diag.inserted.fetch_add(n as u64, Ordering::Relaxed);
             if !events.is_empty() {
-                sink.on_events(std::mem::take(&mut events));
+                shared.sink.on_events(std::mem::take(&mut events));
             }
         }
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Repair requests going out of one socket, each with the next nonce.
+struct Asker<'a> {
+    sock:    &'a UdpSocket,
+    keypair: &'a Keypair,
+    diag:    &'a Diag,
+    nonce:   u32,
+}
+
+impl Asker<'_> {
+    /// Send `peer` the request `build` makes of our key, its identity and a nonce.
+    fn ask(&mut self, (peer, addr): &([u8; 32], SocketAddr), build: impl FnOnce(&Keypair, &[u8; 32], u32) -> Vec<u8>) {
+        match self.sock.send_to(&build(self.keypair, peer, self.nonce), addr) {
+            Ok(_) => self.diag.reqs.fetch_add(1, Ordering::Relaxed),
+            Err(_) => self.diag.send_err.fetch_add(1, Ordering::Relaxed),
+        };
+        self.nonce = self.nonce.wrapping_add(1);
+    }
+}
+
+/// How often gossip is read for repair peers: as often as gossip itself
+/// runs, since its table holds nothing new in between. A read copies every
+/// contact held, thousands of them, and was done on every 10 ms pass.
+const GOSSIP_READ: Duration = Duration::from_millis(solana_gossip::cluster_info::GOSSIP_SLEEP_MILLIS);
+
 fn spawn_dispatch(
     cfg: &ShredNetConfig,
     repair_sock: Arc<UdpSocket>,
     keypair: Arc<Keypair>,
-    exit: Arc<AtomicBool>,
     cluster_info: Arc<solana_gossip::cluster_info::ClusterInfo>,
     reconstructor: Arc<Reconstructor>,
-    sink: Arc<dyn BlockSink>,
-    targets: Arc<Mutex<VecDeque<u64>>>,
-    stakes: Arc<Mutex<HashMap<[u8; 32], u64>>>,
-    observed_tip: Arc<AtomicU64>,
-    diag: Arc<Diag>,
+    shared: Arc<Shared>,
 ) -> JoinHandle<()> {
     const ORPHAN_AFTER: u32 = 5;
     // Peers a HighestWindowIndex / Orphan goes to. One answer is enough, and
@@ -607,8 +561,17 @@ fn spawn_dispatch(
         // Slots determined to have no block (skipped). Never re-admitted; the
         // consumer was told via on_slot_skipped.
         let mut skipped: HashSet<u64> = HashSet::new();
-        let mut nonce: u32 = 0xdead_beef;
+        let (sink, diag) = (&shared.sink, &shared.diag);
+        let mut asker = Asker { sock: &repair_sock, keypair: &keypair, diag, nonce: 0xdead_beef };
         let mut rng: u64 = now_millis() | 1;
+        // The best repair peers gossip holds, with the stake each is drawn by,
+        // and when gossip was read; of them, those not leading now, and the
+        // leaders they were picked against.
+        let mut scored: Vec<(([u8; 32], SocketAddr), u64)> = Vec::new();
+        let mut scored_at = None::<Instant>;
+        let mut peers: Vec<([u8; 32], SocketAddr)> = Vec::new();
+        let mut weights: Vec<u64> = Vec::new();
+        let mut leading: Option<Vec<[u8; 32]>> = None;
         let mut last_purge = Instant::now();
         let mut last_diag = Instant::now();
         // Requests that may go out now; `None` is no limit. A token bucket
@@ -617,16 +580,12 @@ fn spawn_dispatch(
         // in the first ~10 ms, and the answers came back as a burst.
         let (mut budget, mut budget_since) = (repair_rate.map(|_| 0), Instant::now());
 
-        loop {
-            if exit.load(Ordering::Relaxed) {
-                break;
-            }
-
+        while !shared.exiting() {
             // ── admit new targets up to the in-flight window (never re-admit a
             //    slot we've already concluded is skipped) ──
             {
                 let mut room = target_window.saturating_sub(driver.len());
-                let mut q = targets.lock().unwrap_or_else(|e| e.into_inner());
+                let mut q = shared.targets.lock().unwrap_or_else(|e| e.into_inner());
                 while room > 0 {
                     match q.pop_front() {
                         Some(slot) if skipped.contains(&slot) => continue,
@@ -640,14 +599,23 @@ fn spawn_dispatch(
             }
 
             // ── select peers ──
-            let now_ms = now_millis();
-            let stake_map = stakes.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let mut peers = gossip::repair_peers(&cluster_info, &stake_map, now_ms, top_peers);
-            let busy = sink.leaders_near(observed_tip.load(Ordering::Relaxed));
-            peers.retain(|(pk, _)| !busy.contains(pk));
+            if scored_at.is_none_or(|at| at.elapsed() >= GOSSIP_READ) {
+                let stakes = shared.stakes.lock().unwrap_or_else(|e| e.into_inner());
+                scored = gossip::repair_peers(&cluster_info, &stakes, now_millis(), top_peers).into_iter()
+                    .map(|peer| (peer, stakes.get(&peer.0).copied().unwrap_or(0)))
+                    .collect();
+                (scored_at, leading) = (Some(Instant::now()), None);
+            }
+            // Who leads is asked on every pass: it moves with the slot, however
+            // long a slot is, and the pick is redone only when it has moved.
             // Each request goes to a peer drawn by stake, as agave's own repair
             // draws them: a staked node answers more, and no peer is asked in turn.
-            let weights: Vec<u64> = peers.iter().map(|(pk, _)| stake_map.get(pk).copied().unwrap_or(0)).collect();
+            let now_leading = sink.leaders_near(shared.observed_tip.load(Ordering::Relaxed));
+            if leading.as_ref() != Some(&now_leading) {
+                (peers, weights) = scored.iter().filter(|(peer, _)| !now_leading.contains(&peer.0)).copied().unzip();
+                leading = Some(now_leading);
+            }
+            let busy = leading.as_ref().map_or(0, Vec::len);
 
             if let (Some(left), Some(rate)) = (budget.as_mut(), repair_rate)
                 && let Some(add) = refill(rate, budget_since.elapsed()) {
@@ -721,10 +689,8 @@ fn spawn_dispatch(
                             state.last_repair = Instant::now();
                             state.repair_rounds += 1;
                             state.highest_probed = true;
-                            for (pk, addr) in &probe[..n] {
-                                let req = wire::highest_window_index(&keypair, pk, slot, 0, nonce);
-                                send_counted(&repair_sock, &req, addr, &diag);
-                                nonce = nonce.wrapping_add(1);
+                            for peer in &probe[..n] {
+                                asker.ask(peer, |key, to, nonce| wire::highest_window_index(key, to, slot, 0, nonce));
                             }
                         }
                         RepairAction::RequestOrphan => {
@@ -734,10 +700,8 @@ fn spawn_dispatch(
                             }
                             state.last_repair = Instant::now();
                             state.repair_rounds += 1;
-                            for (pk, addr) in &probe[..n] {
-                                let req = wire::orphan(&keypair, pk, slot, nonce);
-                                send_counted(&repair_sock, &req, addr, &diag);
-                                nonce = nonce.wrapping_add(1);
+                            for peer in &probe[..n] {
+                                asker.ask(peer, |key, to, nonce| wire::orphan(key, to, slot, nonce));
                             }
                         }
                         RepairAction::RequestWindows(batch) => {
@@ -764,20 +728,13 @@ fn spawn_dispatch(
                             // ~Nx redundant and trips serve_repair's per-requester
                             // rate limit; unserved indices retry next round against
                             // a different peer.
-                            for idx in &batch[..n] {
-                                let (pk, addr) = &peers[weighted(&weights, &mut rng)];
-                                let req = wire::window_index(&keypair, pk, slot, *idx, nonce);
-                                send_counted(&repair_sock, &req, addr, &diag);
-                                nonce = nonce.wrapping_add(1);
+                            for &idx in &batch[..n] {
+                                asker.ask(&peers[weighted(&weights, &mut rng)], |key, to, nonce| wire::window_index(key, to, slot, idx, nonce));
                             }
                             // Length still unknown: keep asking one peer for
                             // the highest shred, as agave's repair does.
                             if last_index.is_none() {
-                                let (pk, addr) =
-                                    &peers[state.repair_rounds as usize % peers.len()];
-                                let req = wire::highest_window_index(&keypair, pk, slot, 0, nonce);
-                                send_counted(&repair_sock, &req, addr, &diag);
-                                nonce = nonce.wrapping_add(1);
+                                asker.ask(&peers[state.repair_rounds as usize % peers.len()], |key, to, nonce| wire::highest_window_index(key, to, slot, 0, nonce));
                             }
                         }
                     }
@@ -809,9 +766,12 @@ fn spawn_dispatch(
 
             // ── janitor: bound the assembler ──
             if last_purge.elapsed() >= Duration::from_secs(5) {
-                let tip = observed_tip.load(Ordering::Relaxed);
+                let tip = shared.observed_tip.load(Ordering::Relaxed);
                 if tip > keep_window {
                     reconstructor.purge_below(tip - keep_window);
+                    // A slot that far back is not asked for again: kept, the
+                    // set grew by every slot ever skipped.
+                    skipped.retain(|slot| *slot >= tip - keep_window);
                 }
                 last_purge = Instant::now();
             }
@@ -830,10 +790,7 @@ fn spawn_dispatch(
                     }
                 }
                 // Per-slot view of the three oldest in-flight slots.
-                let mut oldest: Vec<u64> = driver.keys().copied().collect();
-                oldest.sort_unstable();
-                for slot in oldest.iter().take(3) {
-                    let st = &driver[slot];
+                for (slot, st) in driver.iter().take(3) {
                     let missing = reconstructor.missing_indices(*slot, 8);
                     eprintln!(
                         "[shred-net]   slot {slot}: last_index={:?} received={:?} full={} rounds={} retries={} probed={} missing[..8]={:?}",
@@ -853,20 +810,20 @@ fn spawn_dispatch(
                     known, driver.len(), full, reconstructor.active_slots(), gaps,
                 );
                 // Sets well behind the tip have had all their turbine shreds.
-                let settled_before = observed_tip.load(Ordering::Relaxed).saturating_sub(64);
+                let settled_before = shared.observed_tip.load(Ordering::Relaxed).saturating_sub(64);
                 let mut coverage = diag.coverage.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some([sets, p10, p50, p90, recoverable]) = coverage_below(&mut coverage, settled_before) {
                     eprintln!(
                         "[coverage] {sets:.0} FEC sets, of 64 shreds each from turbine: p10={p10:.0} p50={p50:.0} p90={p90:.0}; \
                          {recoverable:.1}% rebuildable without repair | leaders skipped for repair={} conflicts={} \
                          off_spec={} entries streamed before their batch was whole={}",
-                        busy.len(), reconstructor.conflicts(), reconstructor.off_spec(), reconstructor.early_entries(),
+                        busy, reconstructor.conflicts(), reconstructor.off_spec(), reconstructor.early_entries(),
                     );
                 }
                 last_diag = Instant::now();
             }
 
-            sleep(Duration::from_millis(10));
+            sleep(DISPATCH_PASS);
         }
     })
 }
@@ -892,13 +849,6 @@ fn grant(budget: &mut Option<u64>, want: usize) -> usize {
             n
         }
     }
-}
-
-fn send_counted(sock: &UdpSocket, req: &[u8], addr: &SocketAddr, diag: &Diag) {
-    match sock.send_to(req, addr) {
-        Ok(_) => diag.reqs.fetch_add(1, Ordering::Relaxed),
-        Err(_) => diag.send_err.fetch_add(1, Ordering::Relaxed),
-    };
 }
 
 fn now_millis() -> u64 {

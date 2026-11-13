@@ -176,7 +176,7 @@ impl LeaderScheduleCache {
 
     /// True once epoch math is known AND at least one epoch schedule is loaded.
     /// Until then the money path emits nothing (fail-closed startup).
-    #[allow(dead_code)] // exercised in tests / diagnostics
+    #[cfg(test)]
     pub fn is_ready(&self) -> bool {
         self.math.is_some() && !self.schedules.is_empty()
     }
